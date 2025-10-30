@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  freqtrade-rl:
+    build: .
+    container_name: freqtrade-rl-trading
+    volumes:
+      # Mount current project directory
+      - ./:/freqtrade
+      # Persist models and data
+      - user_data_models:/freqtrade/user_data/models
+      - user_data_data:/freqtrade/user_data/data
+    ports:
+      # Jupyter notebook port
+      - "8888:8888"
+    environment:
+      - TZ=UTC
+      - PYTHONPATH=/freqtrade
+    networks:
+      - freqtrade-network
+    restart: unless-stopped
+
+  # Optional: Redis for caching (can be enabled later)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: freqtrade-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   networks:
+  #     - freqtrade-network
+
+volumes:
+  user_data_models:
+    driver: local
+  user_data_data:
+    driver: local
+  # redis_data:
+  #   driver: local
+
+networks:
+  freqtrade-network:
+    driver: bridge
