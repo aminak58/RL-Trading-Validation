@@ -1,0 +1,45 @@
+﻿# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+env/
+venv/
+env.bak/
+.venv/
+
+# IDEs
+.vscode/
+.vscode/*
+
+# Logs and temporary files
+logs/
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Freqtrade build / runtime
+backtest_results/
+hyperopt_results/
+
+# Model artifacts and caches (if you want them tracked, remove these)
+models/
+*.h5
+*.pt
+
+# Secrets and credentials - DO NOT commit real keys
+*.key
+*.pem
+*.env
+secrets.json
+
+# Ignore local notebooks outputs
+.ipynb_checkpoints/
+
+# Keep user_data/data (downloaded datasets) tracked - do NOT ignore it
+# If you have very large files, use Git LFS instead
+# user_data/data/
