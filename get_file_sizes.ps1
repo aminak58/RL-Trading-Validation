@@ -1,1 +1,0 @@
-Get-ChildItem "C:\FreqtradeProjects\RL-Trading-Validation\user_data\data\binance\futures" -Recurse -File | Where-Object {$_.Extension -eq ".feather" -or $_.Extension -eq ".json"} | Select-Object Name, @{Name="Size(MB)";Expression={[math]::Round($_.Length/1MB,2)}} | Sort-Object Name | Format-Table -AutoSize
