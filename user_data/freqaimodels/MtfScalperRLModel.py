@@ -718,7 +718,7 @@ class MtfScalperRLModel(ReinforcementLearner):
         actions = []
         confidences = []
         
-        obs = pred_env.reset()
+        obs, _ = pred_env.reset()
         for _ in range(len(filtered_df)):
             action, _states = model.predict(obs, deterministic=True)
             

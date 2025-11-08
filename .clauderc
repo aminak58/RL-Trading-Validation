@@ -1,0 +1,44 @@
+{
+  "include": [
+    "user_data/strategies/**/*.py",
+    "user_data/freqaimodels/**/*.py",
+    "configs/**/*.json",
+    "scripts/**/*.py",
+    "*.py",
+    "*.md"
+  ],
+  "exclude": [
+    "**/__pycache__/**",
+    "**/node_modules/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/env/**",
+    "**/models/**",
+    "**/backtest_results/**",
+    "user_data/data/**",
+    "**/*.feather",
+    "**/*.json",
+    "**/logs/**",
+    "**/.git/**",
+    "**/.ipynb_checkpoints/**"
+  ],
+  "context": {
+    "description": "Freqtrade RL Trading Strategy Project - Hybrid Entry/Exit Strategy with Reinforcement Learning",
+    "key_files": [
+      "user_data/strategies/MtfScalper_RL_Hybrid.py",
+      "user_data/freqaimodels/MtfScalperRLModel.py",
+      "configs/config_rl_hybrid.json",
+      "README.md"
+    ],
+    "language": "python",
+    "framework": "freqtrade",
+    "dependencies": [
+      "freqtrade",
+      "stable-baselines3",
+      "torch",
+      "pandas",
+      "numpy"
+    ]
+  }
+}
+

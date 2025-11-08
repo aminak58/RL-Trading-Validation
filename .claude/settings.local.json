@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(vast:*)",
+      "Bash(ssh:*)",
+      "Bash(vastai show:*)",
+      "Bash(scp:*)",
+      "Bash(vastai search:*)",
+      "Bash(vastai create:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
