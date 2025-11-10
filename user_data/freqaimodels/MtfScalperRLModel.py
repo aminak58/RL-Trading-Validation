@@ -63,7 +63,7 @@ class MtfScalperRLModel(ReinforcementLearner):
         self.clip_range = kwargs.get('clip_range', 0.2)
         self.vf_coef = kwargs.get('vf_coef', 0.5)
         self.ent_coef = kwargs.get('ent_coef', 0.01)
-        self.net_arch = kwargs.get('net_arch', [256, 256, 128])
+        self.net_arch = kwargs.get('net_arch', [512, 256, 128])  # Upgraded for 40+ features
         self.tensorboard_log = kwargs.get('tensorboard_log', None)
         self.model_save_path = kwargs.get('model_save_path', 'user_data/models/')
         self.fee = kwargs.get('fee', 0.001)
@@ -203,10 +203,8 @@ class MtfScalperRLModel(ReinforcementLearner):
                     return penalty
                 else:
                     # Enhanced reward for following classic signal
-                    if current_profit > 0:
-                        return self.classic_signal_reward + current_profit * 50  # Bonus for profitable entries
-                    else:
-                        return -0.5  # Small penalty for unprofitable classic entries
+                    # FIXED: At entry, current_profit is always 0, so reward the signal itself
+                    return self.classic_signal_reward
 
             # ═══════════════════════════════════════════════════════════
             # EXIT ACTION HANDLING (Main Focus)
@@ -427,9 +425,11 @@ class MtfScalperRLModel(ReinforcementLearner):
                 max_price = position_prices.max()
                 max_risk = (max_price - self.position_start_price) / self.position_start_price if self.position_start_price > 0 else 0
             
-            # Calculate risk/reward ratio
+            # Calculate risk/reward ratio with epsilon protection
             if max_risk > 0:
-                risk_reward_ratio = current_profit / max_risk
+                # FIXED: Add epsilon protection to prevent division by zero/NaN
+                epsilon = 1e-10
+                risk_reward_ratio = current_profit / (max_risk + epsilon)
                 
                 if risk_reward_ratio > 3.0:  # Excellent R:R
                     return 5.0
@@ -513,10 +513,9 @@ class MtfScalperRLModel(ReinforcementLearner):
             except:
                 pass
 
-            # Final fallback - allow some exploration for learning
-            # Return True with small probability to encourage exploration
-            import random
-            return random.random() < 0.05  # 5% exploration chance
+            # FIXED: Removed false random signals
+            # Exploration should come from PPO entropy, not fake data
+            return False  # No signal = no trade
         
         def _calculate_current_profit(self) -> float:
             """Calculate current profit percentage"""
@@ -732,7 +731,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                         'cpu_count': 8,
                         'model_type': 'PPO',
                         'policy_type': 'MlpPolicy',
-                        'net_arch': [256, 256, 128],
+                        'net_arch': [512, 256, 128],  # Upgraded for 40+ features
                         'model_reward_parameters': {
                             'rr': 1,
                             'profit_aim': 0.02,

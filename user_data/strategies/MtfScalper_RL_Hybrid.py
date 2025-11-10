@@ -175,7 +175,7 @@ class MtfScalper_RL_Hybrid(IStrategy):
                 "max_trade_duration_candles": 300,  # 25 hours max
                 "model_type": "PPO",
                 "policy_type": "MlpPolicy",
-                "net_arch": [256, 256, 128],
+                "net_arch": [512, 256, 128],  # Upgraded for 40+ features
                 "model_reward_parameters": {
                     "rr": 1,
                     "profit_aim": 0.025,  # 2.5% target
@@ -318,7 +318,38 @@ class MtfScalper_RL_Hybrid(IStrategy):
             (1 / (dataframe["%-volume_ratio_5"] + 0.1)) * 0.3 +
             dataframe["atr"] / dataframe["close"] * 0.4
         )
-        
+
+        # ═══════════════════════════════════════════════════════════
+        # ADVANCED EXIT-SPECIFIC FEATURES (NEW)
+        # ═══════════════════════════════════════════════════════════
+
+        # 1. Profit erosion indicator - when profit starts deteriorating
+        dataframe["%-profit_erosion"] = (
+            dataframe["high"].rolling(20).max() - dataframe["close"]
+        ) / dataframe["close"]
+
+        # 2. Volume exhaustion - decreasing volume indicates trend ending
+        dataframe["%-volume_exhaustion"] = (
+            dataframe["volume"].rolling(5).std() /
+            (dataframe["volume"].rolling(20).std() + 1e-10)
+        )
+
+        # 3. Volatility regime - helps adapt exit strategy to market conditions
+        if "atr" in dataframe.columns:
+            dataframe["%-volatility_regime"] = (
+                dataframe["atr"] / (dataframe["atr"].rolling(50).mean() + 1e-10)
+            )
+        else:
+            dataframe["%-volatility_regime"] = 1.0
+
+        # 4. Time-in-position proxy - how long the current trend has been active
+        if "ema_fast" in dataframe.columns and "ema_slow" in dataframe.columns:
+            dataframe["%-trend_age"] = (
+                (dataframe["ema_fast"] > dataframe["ema_slow"])
+            ).rolling(50).sum()
+        else:
+            dataframe["%-trend_age"] = 0
+
         return dataframe
 
     def feature_engineering_standard(self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
