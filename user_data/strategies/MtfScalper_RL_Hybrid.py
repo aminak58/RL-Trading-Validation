@@ -113,7 +113,7 @@ class MtfScalper_RL_Hybrid(IStrategy):
             
             "feature_parameters": {
                 "include_timeframes": ["5m", "15m", "1h"],
-                "include_corr_pairlist": ["ETH/USDT", "SOL/USDT"],
+                "include_corr_pairlist": [],  # CRITICAL: Must match config JSON exactly!
                 "label_period_candles": 20,
                 "include_shifted_candles": 3,
                 "indicator_periods_candles": [10, 20, 50],
@@ -304,7 +304,8 @@ class MtfScalper_RL_Hybrid(IStrategy):
         Includes raw price data that RL environment needs for price access.
         """
 
-        # Raw price data for RL environment (FreqAI standard requirement)
+        # CRITICAL: Raw price data for RL environment (FreqAI standard requirement)
+        # These are ONLY created here, not duplicated elsewhere
         dataframe["%-raw_close"] = dataframe["close"]
         dataframe["%-raw_open"] = dataframe["open"]
         dataframe["%-raw_high"] = dataframe["high"]
@@ -338,15 +339,9 @@ class MtfScalper_RL_Hybrid(IStrategy):
                 dataframe["%-hour_of_day"] = 0
         except:
             dataframe["%-hour_of_day"] = 0
-        
-        # Add OHLCV data as features for RL model (critical for price access)
-        dataframe["%-close"] = dataframe["close"]
-        dataframe["%-open"] = dataframe["open"]
-        dataframe["%-high"] = dataframe["high"]
-        dataframe["%-low"] = dataframe["low"]
-        dataframe["%-volume"] = dataframe["volume"]
 
-        # Add price-based features that RL needs
+        # NOTE: Raw OHLCV (%-raw_*) are created in feature_engineering_standard()
+        # Here we only add derived price-based features
         dataframe["%-price_change"] = dataframe["close"].pct_change()
         dataframe["%-high_low_ratio"] = dataframe["high"] / dataframe["low"]
         dataframe["%-close_open_ratio"] = dataframe["close"] / dataframe["open"]
@@ -697,13 +692,6 @@ class MtfScalper_RL_Hybrid(IStrategy):
     
     def informative_pairs(self):
         """Define additional pairs for correlation features"""
-        pairs = self.dp.current_whitelist()
-        informative_pairs = []
-        
-        # Add correlated pairs for better market context
-        corr_pairs = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-        for pair in corr_pairs:
-            if pair not in pairs:
-                informative_pairs.append((pair, self.timeframe))
-        
-        return informative_pairs
+        # CRITICAL: Must return empty list to match config's include_corr_pairlist: []
+        # Adding pairs here would create feature mismatch between training and prediction
+        return []
