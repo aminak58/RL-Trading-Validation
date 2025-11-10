@@ -1,0 +1,16 @@
+{
+  "vastai": {
+    "min_gpu_count": 1,
+    "min_gpu_ram_gb": 16,
+    "min_disk_gb": 50,
+    "max_price_per_hour": 0.5,
+    "preferred_gpu_types": ["RTX 3090", "RTX 4090", "A4000", "A5000"],
+    "image": "nvidia/cuda:12.1.1-devel-ubuntu22.04"
+  },
+  "execution": {
+    "max_runtime_hours": 24,
+    "auto_terminate": true,
+    "copy_results": true,
+    "cleanup_temp": true
+  }
+}
