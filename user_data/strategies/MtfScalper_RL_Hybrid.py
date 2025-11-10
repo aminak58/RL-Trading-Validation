@@ -27,6 +27,11 @@ from freqtrade.strategy import (
 )
 from freqtrade.persistence import Trade
 
+# Import data collector
+import sys
+sys.path.insert(0, '/home/user/RL-Trading-Validation')
+from user_data.data_collector import DataCollector
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,7 +101,25 @@ class MtfScalper_RL_Hybrid(IStrategy):
     
     # Risk management
     risk_per_trade: float = 0.02
-    
+
+    # Data collection
+    def __init__(self, config: dict) -> None:
+        super().__init__(config)
+        # Initialize data collector
+        self.data_collector = DataCollector()
+        self.data_collector.set_config({
+            'strategy': 'MtfScalper_RL_Hybrid',
+            'timeframe': self.timeframe,
+            'risk_per_trade': self.risk_per_trade,
+            'reward_weights': {
+                "profit": 0.35,
+                "drawdown_control": 0.25,
+                "timing_quality": 0.20,
+                "risk_reward_ratio": 0.20
+            }
+        })
+        logger.info("Data collector initialized")
+
     # ═══════════════════════════════════════════════════════════
     # FREQAI CONFIGURATION
     # ═══════════════════════════════════════════════════════════
@@ -687,9 +710,148 @@ class MtfScalper_RL_Hybrid(IStrategy):
         ]
     
     # ═══════════════════════════════════════════════════════════
+    # DATA COLLECTION HOOKS
+    # ═══════════════════════════════════════════════════════════
+
+    def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
+                          time_in_force: str, current_time: datetime, entry_tag: Optional[str],
+                          side: str, **kwargs) -> bool:
+        """
+        Override to log trade entry data.
+        """
+        # Get current dataframe
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+        if dataframe is None or dataframe.empty:
+            return True
+
+        # Get features at entry
+        last_candle = dataframe.iloc[-1]
+        features_at_entry = {}
+
+        # Extract all %-prefixed features (RL features)
+        for col in dataframe.columns:
+            if col.startswith('%-') or col.startswith('&-'):
+                try:
+                    features_at_entry[col] = float(last_candle[col])
+                except:
+                    features_at_entry[col] = str(last_candle[col])
+
+        # Also include key technical indicators
+        for indicator in ['rsi', 'adx', 'atr', 'ema_fast', 'ema_slow', 'macd']:
+            if indicator in last_candle:
+                try:
+                    features_at_entry[indicator] = float(last_candle[indicator])
+                except:
+                    pass
+
+        # Log prediction at entry
+        self.data_collector.log_prediction({
+            'timestamp': current_time,
+            'pair': pair,
+            'features': features_at_entry,
+            'prediction': int(last_candle.get('&-action', 0)),
+            'confidence': float(last_candle.get('&-action_confidence', 0.0)),
+            'current_position': 0,  # About to enter
+            'current_profit': 0.0,
+            'entry_signal': entry_tag,
+            'side': side,
+        })
+
+        return True  # Allow trade
+
+    def confirm_trade_exit(self, pair: str, trade: Trade, order_type: str, amount: float,
+                          rate: float, time_in_force: str, exit_reason: str,
+                          current_time: datetime, **kwargs) -> bool:
+        """
+        Override to log trade exit data.
+        """
+        # Get current dataframe
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+        if dataframe is None or dataframe.empty:
+            return True
+
+        # Get features at exit
+        last_candle = dataframe.iloc[-1]
+        features_at_exit = {}
+
+        # Extract all %-prefixed features
+        for col in dataframe.columns:
+            if col.startswith('%-') or col.startswith('&-'):
+                try:
+                    features_at_exit[col] = float(last_candle[col])
+                except:
+                    features_at_exit[col] = str(last_candle[col])
+
+        # Technical indicators
+        for indicator in ['rsi', 'adx', 'atr', 'ema_fast', 'ema_slow', 'macd']:
+            if indicator in last_candle:
+                try:
+                    features_at_exit[indicator] = float(last_candle[indicator])
+                except:
+                    pass
+
+        # Calculate trade duration in candles
+        duration_minutes = (current_time - trade.open_date_utc).total_seconds() / 60
+        duration_candles = int(duration_minutes / 5)  # 5m timeframe
+
+        # Get features at entry (if stored)
+        features_at_entry = {}  # Would need to store this at entry
+
+        # Log complete trade
+        trade_data = {
+            'pair': pair,
+            'entry_time': trade.open_date_utc.isoformat(),
+            'exit_time': current_time.isoformat(),
+            'entry_price': float(trade.open_rate),
+            'exit_price': float(rate),
+            'profit_abs': float(trade.close_profit_abs) if trade.close_profit_abs else 0.0,
+            'profit_pct': float(trade.close_profit) if trade.close_profit else 0.0,
+            'duration_candles': duration_candles,
+            'duration_minutes': duration_minutes,
+            'is_short': trade.is_short,
+            'exit_reason': exit_reason,
+            'features_at_entry': features_at_entry,
+            'features_at_exit': features_at_exit,
+            'rl_action': int(last_candle.get('&-action', 0)),
+            'rl_confidence': float(last_candle.get('&-action_confidence', 0.0)),
+            'stake_amount': float(trade.stake_amount),
+            'leverage': float(trade.leverage) if hasattr(trade, 'leverage') else 1.0,
+        }
+
+        self.data_collector.log_trade(trade_data)
+
+        # Log prediction at exit
+        self.data_collector.log_prediction({
+            'timestamp': current_time,
+            'pair': pair,
+            'features': features_at_exit,
+            'prediction': int(last_candle.get('&-action', 0)),
+            'confidence': float(last_candle.get('&-action_confidence', 0.0)),
+            'current_position': 1 if trade.is_short else -1,
+            'current_profit': float(trade.close_profit) if trade.close_profit else 0.0,
+            'exit_reason': exit_reason,
+        })
+
+        return True  # Allow exit
+
+    def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
+        """Called at the start of each bot loop."""
+        # Can be used for periodic checks
+        pass
+
+    def bot_end(self, **kwargs) -> None:
+        """Called when bot ends - save collected data."""
+        try:
+            logger.info("Saving collected data...")
+            self.data_collector.save_all()
+            logger.info("Data collection complete!")
+        except Exception as e:
+            logger.error(f"Error saving collected data: {e}")
+
+    # ═══════════════════════════════════════════════════════════
     # INFORMATIVE PAIRS (for RL correlation)
     # ═══════════════════════════════════════════════════════════
-    
+
     def informative_pairs(self):
         """Define additional pairs for correlation features"""
         # CRITICAL: Must return empty list to match config's include_corr_pairlist: []

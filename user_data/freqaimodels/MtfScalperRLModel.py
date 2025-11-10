@@ -22,6 +22,11 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
+# Import data collector
+import sys
+sys.path.insert(0, '/home/user/RL-Trading-Validation')
+from user_data.data_collector import DataCollector
+
 logger = logging.getLogger(__name__)
 
 
@@ -142,12 +147,12 @@ class MtfScalperRLModel(ReinforcementLearner):
         def __init__(self, *args, **kwargs):
             """Initialize custom environment"""
             super().__init__(*args, **kwargs)
-            
+
             # Track position information
             self.position_start_price = None
             self.position_start_step = None
             self.max_profit_seen = 0
-            
+
             # Reward parameters (can be overridden)
             self.reward_weights = kwargs.get('reward_weights', {
                 "profit": 0.35,
@@ -155,9 +160,14 @@ class MtfScalperRLModel(ReinforcementLearner):
                 "timing_quality": 0.20,
                 "risk_reward_ratio": 0.20
             })
-            
+
             self.entry_penalty = kwargs.get('entry_penalty', 15.0)
             self.classic_signal_reward = kwargs.get('classic_signal_reward', 2.0)
+
+            # Data collection
+            self.data_collector = kwargs.get('data_collector', None)
+            self.episode_id = 0
+            self.current_episode_steps = []
             
         def calculate_reward(self, action: int) -> float:
             """
@@ -225,7 +235,37 @@ class MtfScalperRLModel(ReinforcementLearner):
                     return 0.01  # Small reward for patient waiting
 
             # Small reward for any valid action to encourage exploration
-            return 0.01
+            reward = 0.01
+
+            # Log reward calculation if data collector available
+            if self.data_collector:
+                try:
+                    current_price = self.prices.iloc[self._current_tick]
+                    current_profit = self._calculate_current_profit()
+
+                    self.data_collector.log_reward_calculation({
+                        'timestamp': self._current_tick,
+                        'pair': getattr(self, 'pair', 'unknown'),
+                        'action': action,
+                        'total_reward': reward,
+                        'components': {
+                            'profit_score': 0,
+                            'drawdown_score': 0,
+                            'timing_score': 0,
+                            'risk_reward_score': 0,
+                        },
+                        'weights': self.reward_weights,
+                        'context': {
+                            'position': self._position,
+                            'profit': current_profit,
+                            'duration': self._current_tick - self.position_start_step if self.position_start_step else 0,
+                            'price': float(current_price),
+                        },
+                    })
+                except Exception as e:
+                    logger.debug(f"Error logging reward: {e}")
+
+            return reward
         
         def _calculate_exit_quality_reward(self, current_profit: float) -> float:
             """
@@ -251,7 +291,35 @@ class MtfScalperRLModel(ReinforcementLearner):
                 self.reward_weights["timing_quality"] * timing_score +
                 self.reward_weights["risk_reward_ratio"] * risk_reward_score
             )
-            
+
+            # Log detailed reward breakdown if data collector available
+            if self.data_collector:
+                try:
+                    current_price = self.prices.iloc[self._current_tick]
+
+                    self.data_collector.log_reward_calculation({
+                        'timestamp': self._current_tick,
+                        'pair': getattr(self, 'pair', 'unknown'),
+                        'action': 'exit',  # This is called during exit
+                        'total_reward': total_reward,
+                        'components': {
+                            'profit_score': profit_score,
+                            'drawdown_score': drawdown_score,
+                            'timing_score': timing_score,
+                            'risk_reward_score': risk_reward_score,
+                        },
+                        'weights': self.reward_weights,
+                        'context': {
+                            'position': self._position,
+                            'profit': current_profit,
+                            'duration': self._current_tick - self.position_start_step if self.position_start_step else 0,
+                            'price': float(current_price),
+                            'max_profit_seen': self.max_profit_seen,
+                        },
+                    })
+                except Exception as e:
+                    logger.debug(f"Error logging exit reward: {e}")
+
             return total_reward
         
         def _calculate_profit_score(self, profit: float) -> float:
@@ -464,8 +532,12 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         def step(self, action: int) -> Tuple:
             """
-            Override step to track position information
+            Override step to track position information and log data
             """
+            # Get current state before action
+            current_price = self.prices.iloc[self._current_tick]
+            current_profit = self._calculate_current_profit()
+
             # Track position entry
             if self._position == 0 and action in [Actions.Long_enter, Actions.Short_enter]:
                 self.position_start_price = self.prices.iloc[self._current_tick]
@@ -477,15 +549,67 @@ class MtfScalperRLModel(ReinforcementLearner):
                 self.position_start_price = None
                 self.position_start_step = None
                 self.max_profit_seen = 0.0
-            
+
             # Call parent step
-            return super().step(action)
+            obs, reward, done, truncated, info = super().step(action)
+
+            # Log step data if data collector available
+            if self.data_collector:
+                try:
+                    step_data = {
+                        'step': self._current_tick,
+                        'action': int(action),
+                        'reward': float(reward),
+                        'state': {
+                            'position': int(self._position),
+                            'entry_price': float(self.position_start_price) if self.position_start_price else 0.0,
+                            'current_price': float(current_price),
+                            'duration': int(self._current_tick - self.position_start_step) if self.position_start_step else 0,
+                            'profit': float(current_profit),
+                        },
+                        'done': bool(done),
+                    }
+                    self.current_episode_steps.append(step_data)
+
+                    # If episode ended, log it
+                    if done:
+                        self.data_collector.log_episode_end(self.episode_id, {
+                            'end_balance': float(self._total_profit),
+                            'total_trades': len([s for s in self.current_episode_steps if s['action'] in [1, 2]]),
+                            'total_steps': len(self.current_episode_steps),
+                        })
+                except Exception as e:
+                    logger.debug(f"Error logging step data: {e}")
+
+            return obs, reward, done, truncated, info
         
         def reset(self, seed=None, options=None):
             """Reset environment and custom tracking variables"""
             self.position_start_price = None
             self.position_start_step = None
             self.max_profit_seen = 0.0
+
+            # Log episode start if data collector available
+            if self.data_collector:
+                try:
+                    # Save previous episode steps if any
+                    if self.current_episode_steps:
+                        for step_data in self.current_episode_steps:
+                            self.data_collector.log_episode_step(self.episode_id, step_data)
+
+                    # Start new episode
+                    self.episode_id += 1
+                    self.current_episode_steps = []
+
+                    self.data_collector.log_episode_start({
+                        'episode_id': self.episode_id,
+                        'pair': getattr(self, 'pair', 'unknown'),
+                        'start_step': 0,
+                        'initial_balance': float(getattr(self, '_total_profit', 1000.0)),
+                    })
+                except Exception as e:
+                    logger.debug(f"Error logging episode start: {e}")
+
             return super().reset()
     
     def fit(self, data_dictionary: Dict[str, DataFrame], pair: str = "") -> Any:
@@ -641,6 +765,20 @@ class MtfScalperRLModel(ReinforcementLearner):
 
         prices_df = pd.DataFrame(price_data)
 
+        # Initialize data collector for RL episodes (training only)
+        data_collector = None
+        if is_train:
+            try:
+                data_collector = DataCollector(output_dir="user_data/analysis_data/rl_training")
+                data_collector.set_config({
+                    'model': 'MtfScalperRLModel',
+                    'pair': pair,
+                    'is_training': True,
+                    'reward_weights': self.reward_weights,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to initialize data collector: {e}")
+
         env_config = {
             "config": config,
             "df_raw": df_raw,
@@ -657,7 +795,8 @@ class MtfScalperRLModel(ReinforcementLearner):
             },
             "window_size": self.window_size,
             "fee": self.fee,
-            "pair": pair
+            "pair": pair,
+            "data_collector": data_collector,  # Pass data collector to environment
         }
 
         env = self.MtfScalperRLEnv(**env_config)
