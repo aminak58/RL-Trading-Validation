@@ -29,7 +29,10 @@ from freqtrade.persistence import Trade
 
 # Import data collector
 import sys
-sys.path.insert(0, '/home/user/RL-Trading-Validation')
+import os
+# Dynamic path resolution - works on any system
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
 from user_data.data_collector import DataCollector
 
 logger = logging.getLogger(__name__)

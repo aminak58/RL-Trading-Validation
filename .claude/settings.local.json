@@ -6,7 +6,15 @@
       "Bash(vastai show:*)",
       "Bash(scp:*)",
       "Bash(vastai search:*)",
-      "Bash(vastai create:*)"
+      "Bash(vastai create:*)",
+      "Bash(python -c \"import sys, json; offers = json.load(sys.stdin); print(f''''Found {len(offers)} offers''''); best = offers[0] if offers else None; print(f''''Best offer: ID={best[\"\"id\"\"]}, GPU={best[\"\"gpu_name\"\"]}, Price=$best[\"\"\"dph_total\"\"\"]:.3f/hr, Location={best.get(\"\"geolocation\"\", \"\"Unknown\"\")}'''') if best else print(''''No offers found'''')\")",
+      "Bash(time ssh:*)",
+      "Bash(python test_ssh_timing.py:*)",
+      "Bash(iconv:*)",
+      "Bash(python:*)",
+      "Bash(test:*)",
+      "Bash(vastai:*)",
+      "Bash(freqtrade backtesting:*)"
     ],
     "deny": [],
     "ask": []

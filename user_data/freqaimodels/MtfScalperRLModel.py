@@ -24,7 +24,10 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 
 # Import data collector
 import sys
-sys.path.insert(0, '/home/user/RL-Trading-Validation')
+import os
+# Dynamic path resolution - works on any system
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
 from user_data.data_collector import DataCollector
 
 logger = logging.getLogger(__name__)
@@ -795,10 +798,13 @@ class MtfScalperRLModel(ReinforcementLearner):
             "window_size": self.window_size,
             "fee": self.fee,
             "pair": pair,
-            "data_collector": data_collector,  # Pass data collector to environment
         }
 
         env = self.MtfScalperRLEnv(**env_config)
+
+        # Set data_collector after environment creation (bypasses BaseEnvironment validation)
+        if data_collector:
+            env.data_collector = data_collector
 
         if is_train:
             # Wrap in monitor for training
