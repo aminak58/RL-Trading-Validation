@@ -12,6 +12,7 @@ Architecture:
 
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+from functools import reduce
 import logging
 import atexit
 import signal
@@ -389,12 +390,65 @@ class MtfScalper_RL_Hybrid(IStrategy):
         else:
             dataframe["%-trend_age"] = 0
 
+        # ═══════════════════════════════════════════════════════════
+        # CRITICAL FIX: CLASSIC ENTRY SIGNALS AS RL FEATURES
+        # ═══════════════════════════════════════════════════════════
+        # Problem: feature_engineering_standard() runs BEFORE populate_entry_trend()
+        # Solution: Calculate classic signals HERE using same logic as populate_entry_trend()
+        # This ensures:
+        # 1. Signals have variance (real calculation, not copy from non-existent columns)
+        # 2. RL model can see classic entry signals during training
+        # 3. Independent of execution order
+
+        # Classic LONG signal (same logic as populate_entry_trend)
+        classic_long_conditions = []
+        if all(col in dataframe.columns for col in ['rsi', 'ema_fast', 'ema_slow', 'adx']):
+            classic_long_conditions.append(dataframe['rsi'] < self.buy_rsi.value)
+            classic_long_conditions.append(dataframe['ema_fast'] > dataframe['ema_slow'])
+            classic_long_conditions.append(dataframe['adx'] > self.adx_thr_buy.value)
+            classic_long_conditions.append(dataframe['volume'] > 0)
+
+            if classic_long_conditions:
+                dataframe['%-classic_long_signal'] = (
+                    reduce(lambda x, y: x & y, classic_long_conditions)
+                ).astype(float)
+            else:
+                dataframe['%-classic_long_signal'] = 0.0
+        else:
+            dataframe['%-classic_long_signal'] = 0.0
+
+        # Classic SHORT signal (same logic as populate_entry_trend)
+        classic_short_conditions = []
+        if all(col in dataframe.columns for col in ['rsi', 'ema_fast', 'ema_slow', 'adx']):
+            classic_short_conditions.append(dataframe['rsi'] > (100 - self.buy_rsi.value))
+            classic_short_conditions.append(dataframe['ema_fast'] < dataframe['ema_slow'])
+            classic_short_conditions.append(dataframe['adx'] > self.adx_thr_buy.value)
+            classic_short_conditions.append(dataframe['volume'] > 0)
+
+            if classic_short_conditions:
+                dataframe['%-classic_short_signal'] = (
+                    reduce(lambda x, y: x & y, classic_short_conditions)
+                ).astype(float)
+            else:
+                dataframe['%-classic_short_signal'] = 0.0
+        else:
+            dataframe['%-classic_short_signal'] = 0.0
+
+        # Combined signal indicator
+        dataframe['%-has_signal'] = (
+            (dataframe['%-classic_long_signal'] == 1) |
+            (dataframe['%-classic_short_signal'] == 1)
+        ).astype(float)
+
         return dataframe
 
     def feature_engineering_standard(self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
         """
         Standard feature engineering required for RL models.
         Includes raw price data that RL environment needs for price access.
+
+        NOTE: Classic signal features are now calculated in feature_engineering_expand_all()
+        to avoid execution order issues (expand_all runs after populate_indicators).
         """
 
         # CRITICAL: Raw price data for RL environment (FreqAI standard requirement)
@@ -404,24 +458,6 @@ class MtfScalper_RL_Hybrid(IStrategy):
         dataframe["%-raw_high"] = dataframe["high"]
         dataframe["%-raw_low"] = dataframe["low"]
         dataframe["%-raw_volume"] = dataframe["volume"]
-
-        # CRITICAL FIX: Add classic entry signals as RL features
-        # This allows RL model to see when classic strategy wants to enter
-        # Without this, RL model never knows about classic signals during training
-        if "enter_long" in dataframe.columns:
-            dataframe["%-classic_long_signal"] = dataframe["enter_long"].astype(float)
-        else:
-            dataframe["%-classic_long_signal"] = 0.0
-
-        if "enter_short" in dataframe.columns:
-            dataframe["%-classic_short_signal"] = dataframe["enter_short"].astype(float)
-        else:
-            dataframe["%-classic_short_signal"] = 0.0
-
-        dataframe["%-has_signal"] = (
-            (dataframe["%-classic_long_signal"] == 1) |
-            (dataframe["%-classic_short_signal"] == 1)
-        ).astype(float)
 
         return dataframe
 
