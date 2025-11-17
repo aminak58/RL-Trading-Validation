@@ -13,6 +13,9 @@ Architecture:
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import logging
+import atexit
+import signal
+import sys
 import numpy as np
 import pandas as pd
 from pandas import DataFrame
@@ -94,8 +97,8 @@ class MtfScalper_RL_Hybrid(IStrategy):
     # FreqAI configuration
     freqai_enabled = True
     
-    # RL Exit thresholds
-    rl_exit_confidence = DecimalParameter(0.5, 0.9, default=0.7, space="sell", optimize=True)
+    # RL Exit thresholds (lowered to work with undertrained model)
+    rl_exit_confidence = DecimalParameter(0.2, 0.5, default=0.3, space="sell", optimize=True)
     max_position_duration = IntParameter(12, 96, default=48, space="sell", optimize=True)  # in 5m candles
     
     # Safety parameters
@@ -121,7 +124,40 @@ class MtfScalper_RL_Hybrid(IStrategy):
                 "risk_reward_ratio": 0.20
             }
         })
-        logger.info("Data collector initialized")
+
+        # Register cleanup handler for backtest mode (bot_end() not called in backtest)
+        atexit.register(self._save_datacollector)
+
+        # Setup signal handlers for graceful shutdown (Ctrl+C, kill, etc.)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+        logger.info("Data collector initialized with atexit and signal handlers")
+
+    def _signal_handler(self, signum, frame):
+        """Handle termination signals gracefully (SIGTERM, SIGINT)"""
+        logger.warning(f"⚠️  Received signal {signum}, saving data before exit...")
+        self._save_datacollector()
+        logger.info("Graceful shutdown complete")
+        sys.exit(0)
+
+    def _save_datacollector(self):
+        """Save DataCollector data on exit - works in backtest mode"""
+        try:
+            if hasattr(self, 'data_collector') and self.data_collector:
+                trades_count = len(self.data_collector.trades)
+                signals_count = len(getattr(self.data_collector, 'signal_propagation', []))
+                decisions_count = len(getattr(self.data_collector, 'model_decisions', []))
+
+                logger.info(f"💾 Saving DataCollector on exit: "
+                           f"Trades={trades_count}, "
+                           f"Signals={signals_count}, "
+                           f"Decisions={decisions_count}")
+
+                self.data_collector.save_all()
+                logger.info("✅ DataCollector saved successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to save DataCollector: {e}")
 
     # ═══════════════════════════════════════════════════════════
     # FREQAI CONFIGURATION
@@ -130,7 +166,7 @@ class MtfScalper_RL_Hybrid(IStrategy):
     def freqai_config(self) -> Dict[str, Any]:
         """Returns FreqAI configuration for RL model"""
         return {
-            "enabled": True,
+            "enabled": False,  # DIAGNOSTIC: Temporarily disabled to test classic strategy baseline
             "purge_old_models": False,
             "train_period_days": 30,
             "backtest_period_days": 7,
@@ -369,6 +405,24 @@ class MtfScalper_RL_Hybrid(IStrategy):
         dataframe["%-raw_low"] = dataframe["low"]
         dataframe["%-raw_volume"] = dataframe["volume"]
 
+        # CRITICAL FIX: Add classic entry signals as RL features
+        # This allows RL model to see when classic strategy wants to enter
+        # Without this, RL model never knows about classic signals during training
+        if "enter_long" in dataframe.columns:
+            dataframe["%-classic_long_signal"] = dataframe["enter_long"].astype(float)
+        else:
+            dataframe["%-classic_long_signal"] = 0.0
+
+        if "enter_short" in dataframe.columns:
+            dataframe["%-classic_short_signal"] = dataframe["enter_short"].astype(float)
+        else:
+            dataframe["%-classic_short_signal"] = 0.0
+
+        dataframe["%-has_signal"] = (
+            (dataframe["%-classic_long_signal"] == 1) |
+            (dataframe["%-classic_short_signal"] == 1)
+        ).astype(float)
+
         return dataframe
 
     def feature_engineering_expand_basic(self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
@@ -425,7 +479,11 @@ class MtfScalper_RL_Hybrid(IStrategy):
         dataframe["macd"] = macd_data["macd"]
         dataframe["roc"] = ta.ROC(dataframe, timeperiod=2)
         dataframe["momentum"] = ta.MOM(dataframe, timeperiod=4)
-        dataframe["bb_upper"], _, dataframe["bb_lower"] = ta.BBANDS(dataframe, timeperiod=20)
+
+        # Bollinger Bands with proper error handling
+        bb_result = ta.BBANDS(dataframe, timeperiod=20)
+        dataframe["bb_upper"], dataframe["bb_middle"], dataframe["bb_lower"] = bb_result
+
         dataframe["cci"] = ta.CCI(dataframe, timeperiod=20)
         dataframe["stoch"] = ta.STOCH(dataframe)["slowk"]
         dataframe["obv"] = ta.OBV(dataframe)
@@ -450,6 +508,17 @@ class MtfScalper_RL_Hybrid(IStrategy):
 
         # Add RL action column placeholder
         dataframe["&-action"] = 0
+
+        # Periodic auto-save to prevent data loss during long training/backtest
+        # This runs during indicator calculation, which happens in both training and backtest
+        if len(dataframe) > 0 and len(dataframe) % 1000 == 0:
+            try:
+                # Save checkpoint with candle count identifier
+                checkpoint_id = f"auto_{len(dataframe)}_{metadata.get('pair', 'unknown')}"
+                self.data_collector.save_all(custom_name=checkpoint_id)
+                logger.info(f"📦 Auto-checkpoint saved at {len(dataframe)} candles for {metadata.get('pair')}")
+            except Exception as e:
+                logger.debug(f"Auto-save skipped: {e}")
 
         return dataframe
     
@@ -531,13 +600,76 @@ class MtfScalper_RL_Hybrid(IStrategy):
         
         dataframe.loc[buy_condition, "enter_long"] = 1
         dataframe.loc[sell_condition, "enter_short"] = 1
-        
-        # Log entry signals for debugging
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # DATA COLLECTION: Signal Generation Logging
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # Count signals for pipeline tracking
+        total_candles = len(dataframe)
+        long_signals = int(buy_condition.sum())
+        short_signals = int(sell_condition.sum())
+        total_signals = long_signals + short_signals
+
+        # Log signal generation for debugging
+        if hasattr(self, 'data_collector') and self.data_collector is not None:
+            # Get current timestamp
+            current_time = dataframe.iloc[-1]['date'] if 'date' in dataframe.columns else pd.Timestamp.now()
+
+            # Log signal generation data
+            signal_data = {
+                'timestamp': current_time,
+                'pair': metadata['pair'],
+                'stage': 'classic_signal_generation',
+                'total_candles': total_candles,
+                'long_signals': long_signals,
+                'short_signals': short_signals,
+                'total_signals': total_signals,
+                'signal_percentage': (total_signals / total_candles) * 100 if total_candles > 0 else 0,
+                'success': total_signals > 0,
+                'failure_reason': 'no_signals_generated' if total_signals == 0 else None
+            }
+            self.data_collector.log_signal_propagation(signal_data)
+
+            # Log detailed signal analysis for pipeline debugging
+            if total_signals > 0:
+                # Analyze why signals were generated
+                avg_adx = float(dataframe.loc[buy_condition | sell_condition, 'adx'].mean())
+                avg_rsi = float(dataframe.loc[buy_condition | sell_condition, 'rsi'].mean())
+                avg_atr_pct = float((dataframe.loc[buy_condition | sell_condition, 'atr'] /
+                                   dataframe.loc[buy_condition | sell_condition, 'close']).mean() * 100)
+
+                analysis_data = {
+                    'timestamp': current_time,
+                    'pair': metadata['pair'],
+                    'selected_action': 0,  # Analysis only, no action
+                    'confidence': 1.0,
+                    'model_output': [0, 0, 0, 0, 0],  # Placeholder
+                    'state_info': {
+                        'signal_analysis': {
+                            'avg_adx': avg_adx,
+                            'avg_rsi': avg_rsi,
+                            'avg_atr_pct': avg_atr_pct,
+                            'adx_threshold': self.adx_thr_buy.value,
+                            'rsi_buy_threshold': self.buy_rsi.value,
+                            'rsi_sell_threshold': self.sell_rsi.value,
+                            'atr_threshold': self.atr_threshold.value,
+                            'timeframes_aligned': True,  # Signals only generated if aligned
+                            'volatility_filtered': True   # Signals only generated if volatility ok
+                        }
+                    }
+                }
+                self.data_collector.log_model_decision(analysis_data)
+
+        # Log entry signals for debugging (keep existing logs)
         if buy_condition.any():
-            logger.info(f"Long entry signal for {metadata['pair']}")
+            logger.info(f"🚀 CLASSIC ENTRY SIGNAL: {long_signals} Long signals for {metadata['pair']}")
         if sell_condition.any():
-            logger.info(f"Short entry signal for {metadata['pair']}")
-        
+            logger.info(f"🚀 CLASSIC ENTRY SIGNAL: {short_signals} Short signals for {metadata['pair']}")
+
+        if total_signals == 0:
+            logger.warning(f"❌ NO CLASSIC SIGNALS: {metadata['pair']} - Entry conditions too restrictive")
+
         return dataframe
     
     # ═══════════════════════════════════════════════════════════
@@ -561,40 +693,141 @@ class MtfScalper_RL_Hybrid(IStrategy):
         
         # Only process if we have FreqAI predictions
         if self.freqai_enabled and "&-action" in dataframe.columns:
-            
+
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # RL Exit Signals
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            
+
             # Get RL predictions (action recommendations)
             rl_actions = dataframe["&-action"]
-            
+
+            # Count RL actions for pipeline debugging
+            rl_entry_actions = ((rl_actions == 1) | (rl_actions == 2)).sum()
+            rl_exit_actions = ((rl_actions == 3) | (rl_actions == 4)).sum()
+            rl_hold_actions = (rl_actions == 0).sum()
+
             # Exit long positions when RL suggests (action 3)
             rl_exit_long = (rl_actions == 3)
-            
+
             # Exit short positions when RL suggests (action 4)
             rl_exit_short = (rl_actions == 4)
-            
+
             # Apply confidence threshold if available
             if "&-action_confidence" in dataframe.columns:
                 confidence = dataframe["&-action_confidence"]
                 rl_exit_long = rl_exit_long & (confidence > self.rl_exit_confidence.value)
                 rl_exit_short = rl_exit_short & (confidence > self.rl_exit_confidence.value)
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # DATA COLLECTION: RL Processing Logging
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            if hasattr(self, 'data_collector') and self.data_collector is not None:
+                # Get current timestamp
+                current_time = dataframe.iloc[-1]['date'] if 'date' in dataframe.columns else pd.Timestamp.now()
+
+                # Count classic signals from entry logic for comparison
+                classic_long_signals = (dataframe["enter_long"] == 1).sum()
+                classic_short_signals = (dataframe["enter_short"] == 1).sum()
+                classic_signals = classic_long_signals + classic_short_signals
+
+                # Log RL processing data
+                rl_processing_data = {
+                    'timestamp': current_time,
+                    'pair': metadata['pair'],
+                    'signal_flow': {
+                        'classic_signals': int(classic_signals),
+                        'rl_entry_actions': int(rl_entry_actions),
+                        'rl_exit_actions': int(rl_exit_actions),
+                        'rl_hold_actions': int(rl_hold_actions),
+                        'total_rl_actions': len(rl_actions),
+                        'rl_available': True,
+                        'success': rl_entry_actions > 0 or rl_exit_actions > 0,
+                        'failure_reason': 'rl_model_no_actions' if rl_entry_actions == 0 and rl_exit_actions == 0 else None,
+                        'pipeline_stage': 'rl_processing'
+                    }
+                }
+                self.data_collector.log_signal_propagation(rl_processing_data)
+
+                # CRITICAL: Detect pipeline breakdown - classic signals but no RL entry actions
+                if classic_signals > 0 and rl_entry_actions == 0:
+                    pipeline_breakdown_data = {
+                        'timestamp': current_time,
+                        'pair': metadata['pair'],
+                        'pipeline_stage': 'rl_entry_conversion',
+                        'success': False,
+                        'failure_reason': 'rl_model_not_converting_classic_signals_to_entry_actions',
+                        'classic_signals': int(classic_signals),
+                        'rl_entry_actions': int(rl_entry_actions),
+                        'conversion_rate': 0.0,
+                        'severity': 'critical'
+                    }
+                    self.data_collector.log_pipeline_breakdown(pipeline_breakdown_data)
+                    logger.error(f"🚨 PIPELINE BREAKDOWN: {metadata['pair']} - {classic_signals} classic signals but 0 RL entry actions!")
+
+                # Log detailed RL model decisions
+                if rl_entry_actions > 0 or rl_exit_actions > 0:
+                    # Analyze RL decision patterns
+                    avg_confidence = float(dataframe["&-action_confidence"].mean()) if "&-action_confidence" in dataframe.columns else 0.0
+                    action_distribution = {
+                        'hold': int(rl_hold_actions),
+                        'enter_long': int((rl_actions == 1).sum()),
+                        'enter_short': int((rl_actions == 2).sum()),
+                        'exit_long': int((rl_actions == 3).sum()),
+                        'exit_short': int((rl_actions == 4).sum())
+                    }
+
+                    model_decision_data = {
+                        'timestamp': current_time,
+                        'pair': metadata['pair'],
+                        'model_decision': {
+                            'avg_confidence': avg_confidence,
+                            'confidence_threshold': self.rl_exit_confidence.value if hasattr(self, 'rl_exit_confidence') else 0.5,
+                            'action_distribution': action_distribution,
+                            'total_predictions': len(rl_actions),
+                            'active_positions': action_distribution['enter_long'] + action_distribution['enter_short'],
+                            'exit_signals': action_distribution['exit_long'] + action_distribution['exit_short']
+                        }
+                    }
+                    self.data_collector.log_model_decision(model_decision_data)
+
+                # Log signal propagation from classic to RL
+                signal_propagation_data = {
+                    'timestamp': current_time,
+                    'pair': metadata['pair'],
+                    'signal_flow': {
+                        'classic_signals_generated': int(classic_signals),
+                        'rl_predictions_available': len(rl_actions),
+                        'rl_entry_actions_taken': int(rl_entry_actions),
+                        'rl_exit_actions_taken': int(rl_exit_actions),
+                        'propagation_success': rl_entry_actions > 0,
+                        'propagation_rate': (rl_entry_actions / classic_signals) if classic_signals > 0 else 0.0,
+                        'pipeline_stage': 'classic_to_rl_conversion'
+                    }
+                }
+                self.data_collector.log_signal_propagation(signal_propagation_data)
+
+            # Log RL processing summary
+            logger.info(f"🤖 RL PROCESSING: {metadata['pair']}")
+            logger.info(f"   Entry actions: {rl_entry_actions}, Exit actions: {rl_exit_actions}, Hold: {rl_hold_actions}")
+
+            if classic_signals > 0 and rl_entry_actions == 0:
+                logger.error(f"🚨 CRITICAL: Classic signals ({classic_signals}) not converted to RL entry actions!")
             
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # Emergency Exit Conditions (Safety)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             
-            # Extreme RSI conditions
+            # Extreme RSI conditions (with proper type checking)
             emergency_exit_long = (
                 (dataframe["rsi"] > 85) |  # Extreme overbought
-                (dataframe["close"] < dataframe["bb_lower"]) |  # Below Bollinger Band
+                (dataframe["close"] < dataframe["bb_lower"].fillna(float('inf'))) |  # Below Bollinger Band
                 (dataframe["%-volume_ratio_5"] < 0.3) if "%-volume_ratio_5" in dataframe.columns else False
             )
-            
+
             emergency_exit_short = (
                 (dataframe["rsi"] < 15) |  # Extreme oversold
-                (dataframe["close"] > dataframe["bb_upper"]) |  # Above Bollinger Band
+                (dataframe["close"] > dataframe["bb_upper"].fillna(float('-inf'))) |  # Above Bollinger Band
                 (dataframe["%-volume_ratio_5"] < 0.3) if "%-volume_ratio_5" in dataframe.columns else False
             )
             
@@ -648,8 +881,22 @@ class MtfScalper_RL_Hybrid(IStrategy):
         
         # Emergency stop
         if current_profit < self.emergency_exit_profit.value:
-            return "emergency_stop"
-        
+            exit_reason = "emergency_stop"
+            # Log to data collector
+            self.data_collector.log_trade({
+                'pair': pair,
+                'exit_time': current_time,
+                'exit_price': current_rate,
+                'profit_abs': trade.calc_profit_abs(current_rate),
+                'profit_pct': current_profit,
+                'duration_candles': trade_duration_candles,
+                'is_short': trade.is_short,
+                'exit_reason': exit_reason,
+                'rl_action': 3 if not trade.is_short else 4,  # Emergency exit
+                'rl_confidence': 1.0,  # High confidence for safety
+            })
+            return exit_reason
+
         return None
     
     # ═══════════════════════════════════════════════════════════
@@ -868,10 +1115,166 @@ class MtfScalper_RL_Hybrid(IStrategy):
 
         return True  # Allow exit
 
+    # ═══════════════════════════════════════════════════════════
+    # ENHANCED DATA COLLECTION (New for RL Debugging)
+    # ═══════════════════════════════════════════════════════════
+
+    def log_signal_generation(self, dataframe: DataFrame, metadata: dict):
+        """
+        Log classic signal generation for debugging pipeline.
+
+        Critical: This tracks where 3.45% classic signals are generated
+        """
+        timestamp = datetime.now()
+
+        # Count signals
+        long_signals = dataframe["enter_long"].sum()
+        short_signals = dataframe["enter_short"].sum()
+        total_signals = long_signals + short_signals
+
+        if total_signals > 0:
+            # Log signal propagation start
+            self.data_collector.log_signal_propagation({
+                'timestamp': timestamp,
+                'pair': metadata['pair'],
+                'classic_long_signal': long_signals,
+                'classic_short_signal': short_signals,
+                'total_candles': len(dataframe),
+                'signal_rate': total_signals / len(dataframe),
+                'pipeline_stage': 'signal_generation',
+                'success': True,
+                'context': {
+                    'current_price': dataframe['close'].iloc[-1],
+                    'volume': dataframe['volume'].iloc[-1] if 'volume' in dataframe else None,
+                    'spread': None,  # Add if available
+                }
+            })
+
+    def log_rl_processing(self, dataframe: DataFrame, metadata: dict):
+        """
+        Log RL model processing and decision making.
+
+        Critical: This tracks RL model predictions vs classic signals
+        """
+        if '&-action' in dataframe.columns:
+            timestamp = datetime.now()
+
+            # Count RL actions
+            action_counts = dataframe['&-action'].value_counts().to_dict()
+
+            # Analyze action distribution
+            hold_actions = action_counts.get(0, 0)
+            enter_long = action_counts.get(1, 0)
+            enter_short = action_counts.get(2, 0)
+            exit_long = action_counts.get(3, 0)
+            exit_short = action_counts.get(4, 0)
+
+            # Get latest RL action for detailed logging
+            latest_action = dataframe['&-action'].iloc[-1]
+            latest_confidence = dataframe.get('&-confidence', pd.Series([0.5] * len(dataframe))).iloc[-1]
+
+            # Log model decision
+            self.data_collector.log_model_decision({
+                'timestamp': timestamp,
+                'pair': metadata['pair'],
+                'model_output': [
+                    action_counts.get(0, 0) / len(dataframe),  # Hold
+                    action_counts.get(1, 0) / len(dataframe),  # Enter Long
+                    action_counts.get(2, 0) / len(dataframe),  # Enter Short
+                    action_counts.get(3, 0) / len(dataframe),  # Exit Long
+                    action_counts.get(4, 0) / len(dataframe),  # Exit Short
+                ],
+                'selected_action': latest_action,
+                'confidence': latest_confidence,
+                'state_info': {
+                    'total_candles': len(dataframe),
+                    'action_distribution': action_counts,
+                    'entry_actions': enter_long + enter_short,
+                    'exit_actions': exit_long + exit_short,
+                    'hold_ratio': hold_actions / len(dataframe),
+                }
+            })
+
+            # Check for signal-to-action mismatch
+            classic_signals = (dataframe["enter_long"].sum() + dataframe["enter_short"].sum())
+            rl_entry_actions = enter_long + enter_short
+
+            if classic_signals > 0 and rl_entry_actions == 0:
+                # This is the critical bug! Classic signals but no RL entry actions
+                self.data_collector.log_pipeline_breakdown({
+                    'timestamp': timestamp,
+                    'pair': metadata['pair'],
+                    'pipeline_stage': 'rl_processing',
+                    'success': False,
+                    'failure_reason': 'rl_model_not_converting_signals_to_actions',
+                    'signal_strength': classic_signals / len(dataframe),
+                    'threshold_required': 0.1,  # At least some conversion expected
+                    'context': {
+                        'classic_signals': classic_signals,
+                        'rl_entry_actions': rl_entry_actions,
+                        'total_candles': len(dataframe),
+                        'hold_actions': hold_actions,
+                        'latest_action': latest_action,
+                        'latest_confidence': latest_confidence
+                    }
+                })
+
+    def log_trade_execution(self, trade: Trade, entry_time: datetime,
+                           entry_price: float, side: str):
+        """
+        Log successful trade execution.
+
+        Critical: This confirms end-to-end pipeline success
+        """
+        self.data_collector.log_trade({
+            'pair': trade.pair,
+            'entry_time': entry_time,
+            'entry_price': entry_price,
+            'is_short': side == 'short',
+            'exit_reason': None,  # Will be filled on exit
+            'features_at_entry': {},  # Will be populated if available
+            'rl_action': 1 if side == 'long' else 2,
+            'rl_confidence': 1.0,  # Trade executed
+        })
+
+        # Log successful signal propagation
+        self.data_collector.log_signal_propagation({
+            'timestamp': entry_time,
+            'pair': trade.pair,
+            'classic_long_signal': 1 if side == 'long' else 0,
+            'classic_short_signal': 1 if side == 'short' else 0,
+            'rl_raw_action': 1 if side == 'long' else 2,
+            'rl_confidence': 1.0,
+            'position_state': 1 if side == 'long' else -1,
+            'trade_executed': True,
+            'pipeline_stage': 'trade_execution',
+            'success': True,
+            'execution_delay_ms': 0,  # Immediate in backtest
+        })
+
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
-        """Called at the start of each bot loop."""
-        # Can be used for periodic checks
-        pass
+        """Called at the start of each bot loop - use for periodic saves and monitoring."""
+
+        # Log DataCollector stats every 15 minutes for progress tracking
+        if current_time.minute % 15 == 0:
+            trades_count = len(self.data_collector.trades)
+            signals_count = len(getattr(self.data_collector, 'signal_propagation', []))
+            decisions_count = len(getattr(self.data_collector, 'model_decisions', []))
+
+            logger.info(f"📊 DataCollector stats at {current_time:%Y-%m-%d %H:%M}: "
+                       f"Trades={trades_count}, "
+                       f"Signals={signals_count}, "
+                       f"Decisions={decisions_count}")
+
+        # Auto-save checkpoint every 6 hours for crash protection
+        if current_time.minute == 0 and current_time.hour % 6 == 0:
+            try:
+                checkpoint_name = f"checkpoint_{current_time:%Y%m%d_%H%M}"
+                logger.info(f"💾 Creating checkpoint: {checkpoint_name}")
+                self.data_collector.save_all(custom_name=checkpoint_name)
+                logger.info(f"✅ Checkpoint saved successfully")
+            except Exception as e:
+                logger.warning(f"⚠️ Checkpoint save failed: {e}")
 
     def bot_end(self, **kwargs) -> None:
         """Called when bot ends - save collected data."""

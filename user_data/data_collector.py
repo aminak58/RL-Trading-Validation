@@ -208,6 +208,96 @@ class DataCollector:
         self.config = config
 
     # ═══════════════════════════════════════════════════════════
+    # SIGNAL PROPAGATION TRACKING (New for RL Debugging)
+    # ═══════════════════════════════════════════════════════════
+
+    def log_signal_propagation(self, signal_data: Dict[str, Any]):
+        """
+        Track signal from generation to execution.
+
+        Critical for debugging: Where do 3.45% classic signals get lost?
+
+        Args:
+            signal_data: {
+                'timestamp': datetime,
+                'pair': 'BTC/USDT:USDT',
+                'classic_long_signal': 1,
+                'classic_short_signal': 0,
+                'rl_raw_action': 1,  # 0=Hold, 1=Enter Long, 2=Enter Short, 3=Exit Long, 4=Exit Short
+                'rl_confidence': 0.85,
+                'position_state': 0,  # 0=none, 1=long, -1=short
+                'trade_executed': False,
+                'execution_delay_ms': 150,
+                'blocking_reason': 'risk_management' if blocked else None,
+            }
+        """
+        # Store in dedicated signal tracking list
+        if not hasattr(self, 'signal_propagation'):
+            self.signal_propagation = []
+
+        self.signal_propagation.append(signal_data)
+
+    def log_model_decision(self, decision_data: Dict[str, Any]):
+        """
+        Record model context and reasoning.
+
+        Args:
+            decision_data: {
+                'timestamp': datetime,
+                'pair': 'BTC/USDT:USDT',
+                'top_features': {
+                    'momentum_5': 0.0234,
+                    'rsi_14': 65.2,
+                    'adx_14': 28.5,
+                    # Top 10 most influential features
+                },
+                'model_output': [0.1, 0.7, 0.1, 0.05, 0.05],  # Action probabilities
+                'selected_action': 1,
+                'confidence': 0.7,
+                'state_info': {
+                    'in_position': True,
+                    'position_duration': 45,
+                    'current_profit': 0.015,
+                    'drawdown': -0.005,
+                },
+                'reward_context': {
+                    'potential_reward': 2.5,
+                    'last_reward': -0.3,
+                    'reward_components': {...}
+                }
+            }
+        """
+        if not hasattr(self, 'model_decisions'):
+            self.model_decisions = []
+
+        self.model_decisions.append(decision_data)
+
+    def log_pipeline_breakdown(self, breakdown_data: Dict[str, Any]):
+        """
+        Identify where signal pipeline fails.
+
+        Args:
+            breakdown_data: {
+                'timestamp': datetime,
+                'pair': 'BTC/USDT:USDT',
+                'pipeline_stage': 'entry_confirmation',  # signal_generation, rl_processing, trade_execution
+                'success': False,
+                'failure_reason': 'insufficient_confidence',
+                'signal_strength': 0.65,
+                'threshold_required': 0.7,
+                'context': {
+                    'market_volatility': 0.04,
+                    'position_limit_reached': True,
+                    'risk_score': 0.8,
+                }
+            }
+        """
+        if not hasattr(self, 'pipeline_breakdowns'):
+            self.pipeline_breakdowns = []
+
+        self.pipeline_breakdowns.append(breakdown_data)
+
+    # ═══════════════════════════════════════════════════════════
     # DATA EXPORT
     # ═══════════════════════════════════════════════════════════
 
@@ -248,6 +338,24 @@ class DataCollector:
             self._save_json(rewards_path, self.reward_breakdown)
             logger.info(f"Saved {len(self.reward_breakdown)} reward entries to {rewards_path}")
 
+        # Save signal propagation (new)
+        if hasattr(self, 'signal_propagation') and self.signal_propagation:
+            signal_path = self.output_dir / f"signal_propagation_{suffix}.json"
+            self._save_json(signal_path, self.signal_propagation)
+            logger.info(f"Saved {len(self.signal_propagation)} signal propagation entries to {signal_path}")
+
+        # Save model decisions (new)
+        if hasattr(self, 'model_decisions') and self.model_decisions:
+            decisions_path = self.output_dir / f"model_decisions_{suffix}.json"
+            self._save_json(decisions_path, self.model_decisions)
+            logger.info(f"Saved {len(self.model_decisions)} model decision entries to {decisions_path}")
+
+        # Save pipeline breakdowns (new)
+        if hasattr(self, 'pipeline_breakdowns') and self.pipeline_breakdowns:
+            pipeline_path = self.output_dir / f"pipeline_breakdowns_{suffix}.json"
+            self._save_json(pipeline_path, self.pipeline_breakdowns)
+            logger.info(f"Saved {len(self.pipeline_breakdowns)} pipeline breakdown entries to {pipeline_path}")
+
         # Save summary
         summary = self._generate_summary()
         summary_path = self.output_dir / f"summary_{suffix}.json"
@@ -256,6 +364,9 @@ class DataCollector:
 
         # Also save as CSV for easier analysis
         self._save_as_csv(suffix)
+
+        # Also save new data as CSV
+        self._save_new_data_as_csv(suffix)
 
     def _save_json(self, path: Path, data: Any):
         """Save data as JSON with datetime handling."""
@@ -306,6 +417,52 @@ class DataCollector:
             predictions_df.to_csv(predictions_csv, index=False)
             logger.info(f"Saved predictions CSV: {predictions_csv}")
 
+    def _save_new_data_as_csv(self, suffix: str):
+        """Save new debugging data as CSV for easier analysis."""
+
+        # Signal propagation CSV
+        if hasattr(self, 'signal_propagation') and self.signal_propagation:
+            signals_df = pd.DataFrame(self.signal_propagation)
+            signals_csv = self.output_dir / f"signal_propagation_{suffix}.csv"
+            signals_df.to_csv(signals_csv, index=False)
+            logger.info(f"Saved signal propagation CSV: {signals_csv}")
+
+        # Model decisions CSV
+        if hasattr(self, 'model_decisions') and self.model_decisions:
+            # Flatten nested data for CSV
+            decisions_flat = []
+            for decision in self.model_decisions:
+                flat = {
+                    'timestamp': decision.get('timestamp'),
+                    'pair': decision.get('pair'),
+                    'selected_action': decision.get('selected_action'),
+                    'confidence': decision.get('confidence'),
+                }
+
+                # Add top features
+                if 'top_features' in decision:
+                    for feature, value in decision['top_features'].items():
+                        flat[f'feature_{feature}'] = value
+
+                # Add state info
+                if 'state_info' in decision:
+                    for key, value in decision['state_info'].items():
+                        flat[f'state_{key}'] = value
+
+                decisions_flat.append(flat)
+
+            decisions_df = pd.DataFrame(decisions_flat)
+            decisions_csv = self.output_dir / f"model_decisions_{suffix}.csv"
+            decisions_df.to_csv(decisions_csv, index=False)
+            logger.info(f"Saved model decisions CSV: {decisions_csv}")
+
+        # Pipeline breakdowns CSV
+        if hasattr(self, 'pipeline_breakdowns') and self.pipeline_breakdowns:
+            breakdowns_df = pd.DataFrame(self.pipeline_breakdowns)
+            breakdowns_csv = self.output_dir / f"pipeline_breakdowns_{suffix}.csv"
+            breakdowns_df.to_csv(breakdowns_csv, index=False)
+            logger.info(f"Saved pipeline breakdowns CSV: {breakdowns_csv}")
+
     def _generate_summary(self) -> Dict[str, Any]:
         """Generate summary statistics."""
         summary = {
@@ -317,6 +474,9 @@ class DataCollector:
                 'rl_episodes': len(self.rl_episodes),
                 'predictions': len(self.predictions),
                 'reward_entries': len(self.reward_breakdown),
+                'signal_propagation': len(getattr(self, 'signal_propagation', [])),
+                'model_decisions': len(getattr(self, 'model_decisions', [])),
+                'pipeline_breakdowns': len(getattr(self, 'pipeline_breakdowns', [])),
             },
         }
 

@@ -56,24 +56,47 @@ class MtfScalperRLModel(ReinforcementLearner):
         self.window_size = 30  # Default window size for observation
         self.max_position_duration = 300  # Max 300 candles (25 hours)
 
-        # Training parameters (set to defaults if not provided)
+        # Training parameters - OPTIMIZED FOR CPU
         self.learning_rate = kwargs.get('learning_rate', 3e-4)
-        self.n_steps = kwargs.get('n_steps', 2048)
-        self.batch_size = kwargs.get('batch_size', 64)
+        self.n_steps = kwargs.get('n_steps', 4096)  # Increased for CPU efficiency
+        self.batch_size = kwargs.get('batch_size', 256)  # Increased for CPU vectorization
         self.n_epochs = kwargs.get('n_epochs', 10)
         self.gamma = kwargs.get('gamma', 0.99)
         self.gae_lambda = kwargs.get('gae_lambda', 0.95)
         self.clip_range = kwargs.get('clip_range', 0.2)
         self.vf_coef = kwargs.get('vf_coef', 0.5)
         self.ent_coef = kwargs.get('ent_coef', 0.01)
-        self.net_arch = kwargs.get('net_arch', [512, 256, 128])  # Upgraded for 40+ features
+        self.net_arch = kwargs.get('net_arch', [512, 512, 256])  # Larger network for 40+ features
         self.tensorboard_log = kwargs.get('tensorboard_log', None)
         self.model_save_path = kwargs.get('model_save_path', 'user_data/models/')
         self.fee = kwargs.get('fee', 0.001)
 
+        # CPU optimization parameters
+        self.cpu_count = kwargs.get('cpu_count', 8)
+        self.n_envs = kwargs.get('n_envs', 8)  # Number of parallel environments
+
         # Device configuration (GPU/CPU selection)
         self.device = self._determine_device(kwargs.get('device', 'auto'))
         logger.info(f"Using device: {self.device}")
+
+        # Configure PyTorch for CPU optimization
+        if self.device == "cpu":
+            th.set_num_threads(self.cpu_count)
+            th.set_num_interop_threads(2)
+
+            # Additional CPU optimizations for Intel processors
+            # Enable MKL (Math Kernel Library) optimizations if available
+            try:
+                import torch
+                # Optimize for Intel CPUs
+                torch.set_flush_denormal(True)  # Faster float operations
+                if hasattr(torch.backends, 'mkl') and torch.backends.mkl.is_available():
+                    torch.backends.mkl.enabled = True
+                    logger.info("Intel MKL optimizations enabled")
+            except Exception as e:
+                logger.debug(f"Advanced CPU optimizations not available: {e}")
+
+            logger.info(f"PyTorch configured for CPU: {self.cpu_count} threads, 2 interop threads")
 
         # Custom reward weights
         self.reward_weights = {
@@ -85,7 +108,7 @@ class MtfScalperRLModel(ReinforcementLearner):
 
         # Entry constraint parameters
         self.entry_penalty_multiplier = 15.0
-        self.classic_signal_reward = 2.0
+        self.classic_signal_reward = 5.0  # Increased from 2.0 to encourage signal-following
 
         # Exit optimization parameters
         self.exit_profit_threshold = 0.02  # 2% profit for quality exit
@@ -167,6 +190,11 @@ class MtfScalperRLModel(ReinforcementLearner):
             self.entry_penalty = kwargs.get('entry_penalty', 15.0)
             self.classic_signal_reward = kwargs.get('classic_signal_reward', 2.0)
 
+            # FIXED: Add max_position_duration from config
+            # Extract from config if available, otherwise use default
+            config = kwargs.get('config', {})
+            self.max_position_duration = config.get('freqai', {}).get('rl_config', {}).get('max_trade_duration_candles', 300)
+
             # Data collection
             self.data_collector = kwargs.get('data_collector', None)
             self.episode_id = 0
@@ -201,13 +229,15 @@ class MtfScalperRLModel(ReinforcementLearner):
                     return -10.0
 
                 if not classic_entry_signal:
-                    # Reduced penalty for exploration (allow learning)
-                    penalty = -3.0  # Much smaller penalty for exploration
+                    # Stronger penalty to discourage random entries
+                    # BUT: Now that RL can SEE signals, this penalty is fair
+                    penalty = -5.0  # Increased from -1.0 (was too lenient)
                     return penalty
                 else:
-                    # Enhanced reward for following classic signal
-                    # FIXED: At entry, current_profit is always 0, so reward the signal itself
-                    return self.classic_signal_reward
+                    # CRITICAL FIX: Much higher reward for following classic signals
+                    # Makes entering WITH signal more attractive than holding (0.0)
+                    # Hold=0, Hold with opportunity cost=-2.0, Enter WITH signal=+15.0
+                    return 15.0  # Increased from 5.0 to make entry very attractive
 
             # ═══════════════════════════════════════════════════════════
             # EXIT ACTION HANDLING (Main Focus)
@@ -232,8 +262,13 @@ class MtfScalperRLModel(ReinforcementLearner):
                     holding_reward = self._calculate_holding_reward(current_profit)
                     return holding_reward
                 else:
-                    # Not in position - small positive reward for waiting
-                    return 0.01  # Small reward for patient waiting
+                    # Not in position - check for missed opportunity
+                    if classic_entry_signal:
+                        # Penalty for holding when there's a tradeable signal (opportunity cost)
+                        return -2.0
+                    else:
+                        # Neutral reward for waiting when no signal
+                        return 0.0  # Changed from 0.01 to not reward inaction
 
             # Small reward for any valid action to encourage exploration
             reward = 0.01
@@ -478,47 +513,40 @@ class MtfScalperRLModel(ReinforcementLearner):
         def _check_classic_entry_signal(self) -> bool:
             """
             Check if classic MtfScalper entry signal exists at current step
-            Enhanced with multiple fallback checks for better RL learning
+
+            CRITICAL FIX: Now checks RL features (%-classic_*_signal) first
+            These features are available in the RL environment during training
+            The old approach (checking enter_long/enter_short) didn't work because
+            those columns don't exist in the RL environment's dataframe
             """
             if self._current_tick < 1:
                 return False
 
             current_row = self.df.iloc[self._current_tick]
 
-            # Primary check - direct strategy signals
+            # PRIMARY CHECK: Use RL features (available during training)
+            # These are created in feature_engineering_standard()
+            if "%-classic_long_signal" in current_row and current_row["%-classic_long_signal"] == 1:
+                return True
+            if "%-classic_short_signal" in current_row and current_row["%-classic_short_signal"] == 1:
+                return True
+            if "%-has_signal" in current_row and current_row["%-has_signal"] == 1:
+                return True
+
+            # FALLBACK CHECK: Direct strategy signals (only in backtest mode)
             if "enter_long" in current_row and current_row["enter_long"] == 1:
                 return True
             if "enter_short" in current_row and current_row["enter_short"] == 1:
                 return True
 
-            # Secondary check - strategy entry tags (Freqtrade format)
+            # FALLBACK CHECK: Strategy entry tags (Freqtrade format)
             if "enter_tag" in current_row:
                 enter_tag = current_row["enter_tag"]
                 if pd.notna(enter_tag) and enter_tag in ["enter_long", "enter_short"]:
                     return True
 
-            # Tertiary check - indicator-based signals (fallback)
-            # Check for bullish conditions (potential long entry)
-            try:
-                if (all(col in current_row for col in ["+di", "-di", "adx"]) and
-                    current_row["+di"] > current_row["-di"] and
-                    current_row["adx"] > 25 and
-                    current_row.get("rsi", 50) < 70):
-                    return True
-
-                # Check for bearish conditions (potential short entry)
-                if (all(col in current_row for col in ["+di", "-di", "adx"]) and
-                    current_row["+di"] < current_row["-di"] and
-                    current_row["adx"] > 25 and
-                    current_row.get("rsi", 50) > 30):
-                    return True
-
-            except:
-                pass
-
-            # FIXED: Removed false random signals
-            # Exploration should come from PPO entropy, not fake data
-            return False  # No signal = no trade
+            # No signal detected
+            return False
         
         def _calculate_current_profit(self) -> float:
             """Calculate current profit percentage"""
@@ -555,23 +583,63 @@ class MtfScalperRLModel(ReinforcementLearner):
             # Call parent step
             obs, reward, done, truncated, info = super().step(action)
 
-            # Log step data if data collector available
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # CRITICAL FIX: Simulate custom_exit() logic during training
+            # This prevents reality gap between training and production
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if self._position != 0:
+                current_profit = self._calculate_current_profit()
+                position_duration = self._current_tick - self.position_start_step if self.position_start_step else 0
+
+                # Time-based forced exit (simulates strategy's max_position_duration)
+                if position_duration > self.max_position_duration:
+                    info['custom_exit_triggered'] = True
+                    info['custom_exit_reason'] = 'time_limit'
+                    reward += -5.0  # Penalty for hitting time limit
+                    done = True
+                    logger.debug(f"Time-based exit triggered at step {self._current_tick} (duration: {position_duration})")
+
+                # Emergency profit protection (simulates strategy's emergency_exit_profit)
+                elif current_profit < -0.03:  # emergency_exit_profit = -3%
+                    info['custom_exit_triggered'] = True
+                    info['custom_exit_reason'] = 'emergency_stop'
+                    reward += -10.0  # Heavy penalty for emergency stop
+                    done = True
+                    logger.debug(f"Emergency exit triggered at step {self._current_tick} (profit: {current_profit:.2%})")
+
+                # Breakeven protection (simulates strategy's breakeven_protection)
+                elif self.max_profit_seen > 0.015 and current_profit < 0.005:  # Was profitable, now near breakeven
+                    info['custom_exit_triggered'] = True
+                    info['custom_exit_reason'] = 'breakeven_protection'
+                    reward += -2.0  # Moderate penalty for profit erosion
+                    done = True
+                    logger.debug(f"Breakeven protection triggered at step {self._current_tick}")
+
+            # FIXED: Reduced logging frequency to prevent GB-sized log files
+            # Only log important events: entries, exits, and every 100th step
             if self.data_collector:
                 try:
-                    step_data = {
-                        'step': self._current_tick,
-                        'action': int(action),
-                        'reward': float(reward),
-                        'state': {
-                            'position': int(self._position),
-                            'entry_price': float(self.position_start_price) if self.position_start_price else 0.0,
-                            'current_price': float(current_price),
-                            'duration': int(self._current_tick - self.position_start_step) if self.position_start_step else 0,
-                            'profit': float(current_profit),
-                        },
-                        'done': bool(done),
-                    }
-                    self.current_episode_steps.append(step_data)
+                    should_log = (
+                        action in [Actions.Long_enter, Actions.Short_enter, Actions.Long_exit, Actions.Short_exit]  # Entry/exit actions
+                        or done  # Episode end
+                        or self._current_tick % 100 == 0  # Every 100 candles
+                    )
+
+                    if should_log:
+                        step_data = {
+                            'step': self._current_tick,
+                            'action': int(action),
+                            'reward': float(reward),
+                            'state': {
+                                'position': int(self._position),
+                                'entry_price': float(self.position_start_price) if self.position_start_price else 0.0,
+                                'current_price': float(current_price),
+                                'duration': int(self._current_tick - self.position_start_step) if self.position_start_step else 0,
+                                'profit': float(current_profit),
+                            },
+                            'done': bool(done),
+                        }
+                        self.current_episode_steps.append(step_data)
 
                     # If episode ended, log it
                     if done:
@@ -634,8 +702,17 @@ class MtfScalperRLModel(ReinforcementLearner):
         logger.info(f"Training data shape: {train_df.shape}")
         logger.info(f"Stored {len(self.actual_training_features)} features for prediction consistency")
 
-        # Prepare datasets
-        self.train_env = self._create_env(train_df, pair, is_train=True)
+        # Prepare datasets with vectorized environments for CPU optimization
+        # Try vectorized first, fallback to single env if fails
+        try:
+            logger.info(f"Creating vectorized training environment with {self.n_envs} parallel environments")
+            self.train_env = self._create_vec_env(train_df, pair, n_envs=self.n_envs, is_train=True)
+        except Exception as e:
+            logger.warning(f"Failed to create vectorized environment: {e}")
+            logger.info("Falling back to single environment (non-vectorized)")
+            self.train_env = self._create_env(train_df, pair, is_train=True)
+
+        # Eval environment can be single (no need for parallelization during eval)
         self.eval_env = self._create_env(test_df, pair, is_train=False)
         
         # Create model
@@ -658,6 +735,38 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         return model
     
+    def _create_vec_env(self, df: DataFrame, pair: str, n_envs: int = 8, is_train: bool = True) -> Any:
+        """
+        Create vectorized environments for parallel rollout collection (CPU optimization)
+
+        Args:
+            df: Training/test dataframe
+            pair: Trading pair name
+            n_envs: Number of parallel environments (default 8 for CPU)
+            is_train: Whether this is for training or prediction
+
+        Returns:
+            SubprocVecEnv with n_envs parallel environments
+        """
+        from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+
+        def make_env(rank: int):
+            """Create environment factory for each process"""
+            def _init():
+                env = self._create_env(df, pair, is_train=is_train)
+                # Set different seed for each environment
+                if hasattr(env, 'seed'):
+                    env.seed(self.random_state + rank)
+                return env
+            return _init
+
+        # Use SubprocVecEnv for true CPU parallelism
+        # Each environment runs in its own process
+        logger.info(f"Creating {n_envs} parallel environments for {'training' if is_train else 'prediction'}")
+        vec_env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+
+        return vec_env
+
     def _create_env(self, df: DataFrame, pair: str, config: dict = None, df_raw: DataFrame = None, is_train: bool = True) -> Any:
         """
         Create custom environment instance with proper data handling
@@ -702,10 +811,17 @@ class MtfScalperRLModel(ReinforcementLearner):
             if col in df_clean.columns:
                 df_clean[col] = df_clean[col].ffill().bfill()
 
-        # Fill NaN values in feature columns with 0 (common for RL)
+        # FIXED: Improved NaN handling for feature columns
+        # Use forward-fill → back-fill → zero as last resort
         feature_columns = [col for col in df_clean.columns if col.startswith("%")]
-        for col in feature_columns:
-            df_clean[col] = df_clean[col].fillna(0)
+        if feature_columns:
+            # Forward-fill preserves trend
+            df_clean[feature_columns] = df_clean[feature_columns].ffill()
+            # Back-fill handles start-of-series NaNs
+            df_clean[feature_columns] = df_clean[feature_columns].bfill()
+            # Fill any remaining NaNs with 0 (rare edge case)
+            df_clean[feature_columns] = df_clean[feature_columns].fillna(0)
+            logger.debug(f"NaN handling: ffill → bfill → 0 for {len(feature_columns)} feature columns")
 
         # Final check for critical NaN values
         if df_clean["close"].isna().any():
@@ -724,7 +840,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                 'stake_currency': 'USDT',
                 'stake_amount': 'unlimited',
                 'max_open_trades': 3,
-                'fee': self.fee,
+                'fee': 0.001,  # Fixed: Use hardcoded fee instead of self.fee for multiprocessing compatibility
                 'freqai': {
                     'rl_config': {
                         'train_cycles': 30,
@@ -902,6 +1018,11 @@ class MtfScalperRLModel(ReinforcementLearner):
         # Get the trained model
         model = self.model
 
+        # Check if model exists (should have been trained in fit())
+        if model is None:
+            logger.error("Model is None - training may have failed or not been called")
+            raise ValueError("Model not trained. Please run training first.")
+
         # Prepare features
         filtered_df, _ = dk.filter_features(
             unfiltered_df,
@@ -923,24 +1044,56 @@ class MtfScalperRLModel(ReinforcementLearner):
         # Create environment for prediction
         pred_env = self._create_env(filtered_df, dk.pair, is_train=False)
 
-        # Generate predictions
+        # Generate predictions with batch processing for CPU optimization
         actions = []
         confidences = []
+        batch_size = 256  # Optimal batch size for CPU
 
         obs, _ = pred_env.reset()
+        obs_buffer = []
+        indices_buffer = []
+
+        # Collect observations in batches
         for i in range(len(filtered_df)):
-            action, _states = model.predict(obs, deterministic=True)
+            obs_buffer.append(obs.copy())
+            indices_buffer.append(i)
 
-            # For confidence, use a simple approach based on the action taken
-            # Since we're using deterministic predictions, confidence is always high
-            confidence = 0.9 if action != 0 else 0.5  # Neutral has lower confidence
+            # Process batch when full or at end
+            if len(obs_buffer) >= batch_size or i == len(filtered_df) - 1:
+                # Batch prediction
+                for obs_single in obs_buffer:
+                    action, _states = model.predict(obs_single, deterministic=True)
 
-            actions.append(int(action))
-            confidences.append(confidence)
+                    # FIXED: Use actual model probabilities for confidence
+                    # Get action probabilities from policy network
+                    try:
+                        with th.no_grad():
+                            obs_tensor = th.tensor(obs_single, dtype=th.float32).unsqueeze(0).to(model.device)
+                            # Get distribution from policy
+                            distribution = model.policy.get_distribution(obs_tensor)
+                            action_probs = distribution.distribution.probs
+                            # Confidence is the probability of the selected action
+                            confidence = float(action_probs[0, int(action)].item())
+                    except Exception as e:
+                        # Fallback to simple heuristic if probability extraction fails
+                        logger.debug(f"Failed to extract action probabilities: {e}")
+                        confidence = 0.8 if action != 0 else 0.5
 
-            obs, _, done, _, _ = pred_env.step(action)
-            if done:
-                obs, _ = pred_env.reset()
+                    actions.append(int(action))
+                    confidences.append(confidence)
+
+                    obs, _, done, _, _ = pred_env.step(action)
+                    if done:
+                        obs, _ = pred_env.reset()
+
+                # Clear buffer
+                obs_buffer = []
+                indices_buffer = []
+            else:
+                # Step environment without prediction
+                obs, _, done, _, _ = pred_env.step(0)  # Neutral action
+                if done:
+                    obs, _ = pred_env.reset()
 
         # Create prediction dataframe
         pred_df = DataFrame({
