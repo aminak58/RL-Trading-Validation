@@ -226,18 +226,21 @@ class MtfScalperRLModel(ReinforcementLearner):
 
                 if not self._is_valid(action):
                     # Invalid entry (already in position)
-                    return -10.0
+                    # REDUCED PENALTY: Was -10.0 which made model too risk-averse
+                    # Now just a gentle "no" signal to allow exploration
+                    return -1.0
 
                 if not classic_entry_signal:
-                    # Stronger penalty to discourage random entries
-                    # BUT: Now that RL can SEE signals, this penalty is fair
-                    penalty = -5.0  # Increased from -1.0 (was too lenient)
+                    # Moderate penalty for entry without signal
+                    # REDUCED: Was -5.0, now -2.0 to encourage some exploration
+                    # Still negative to discourage random entries
+                    penalty = -2.0
                     return penalty
                 else:
-                    # CRITICAL FIX: Much higher reward for following classic signals
-                    # Makes entering WITH signal more attractive than holding (0.0)
-                    # Hold=0, Hold with opportunity cost=-2.0, Enter WITH signal=+15.0
-                    return 15.0  # Increased from 5.0 to make entry very attractive
+                    # HIGH REWARD: Entry with classic signal
+                    # Clear positive incentive to follow signals
+                    # Gradient: +15.0 (entry+signal) >> 0 (hold) > -2.0 (entry-no-signal) > -5.0 (hold+signal)
+                    return 15.0
 
             # ═══════════════════════════════════════════════════════════
             # EXIT ACTION HANDLING (Main Focus)
@@ -264,11 +267,13 @@ class MtfScalperRLModel(ReinforcementLearner):
                 else:
                     # Not in position - check for missed opportunity
                     if classic_entry_signal:
-                        # Penalty for holding when there's a tradeable signal (opportunity cost)
-                        return -2.0
+                        # INCREASED PENALTY: Stronger opportunity cost to encourage taking signals
+                        # Was -2.0, now -5.0 to make holding with signal less attractive
+                        # This creates clear gradient: Entry+Signal(+15) >> Hold(-5)
+                        return -5.0
                     else:
                         # Neutral reward for waiting when no signal
-                        return 0.0  # Changed from 0.01 to not reward inaction
+                        return 0.0  # No penalty for patience when no opportunity
 
             # Small reward for any valid action to encourage exploration
             reward = 0.01
