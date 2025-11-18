@@ -98,12 +98,13 @@ class MtfScalperRLModel(ReinforcementLearner):
 
             logger.info(f"PyTorch configured for CPU: {self.cpu_count} threads, 2 interop threads")
 
-        # Custom reward weights
+        # Custom reward weights (must sum to 1.0)
+        # Rebalanced: Increased profit focus, reduced drawdown emphasis for undertrained models
         self.reward_weights = {
-            "profit": 0.35,
-            "drawdown_control": 0.25,
-            "timing_quality": 0.20,
-            "risk_reward_ratio": 0.20
+            "profit": 0.45,              # Increased from 0.35 to prioritize profitable trades
+            "drawdown_control": 0.15,     # Reduced from 0.25 to avoid excessive risk aversion
+            "timing_quality": 0.20,       # Unchanged
+            "risk_reward_ratio": 0.20     # Unchanged
         }
 
         # Entry constraint parameters

@@ -99,8 +99,8 @@ class MtfScalper_RL_Hybrid(IStrategy):
     freqai_enabled = True
     
     # RL Exit thresholds (lowered to work with undertrained model)
-    rl_exit_confidence = DecimalParameter(0.2, 0.5, default=0.3, space="sell", optimize=True)
-    max_position_duration = IntParameter(12, 96, default=48, space="sell", optimize=True)  # in 5m candles
+    rl_exit_confidence = DecimalParameter(0.1, 0.3, default=0.2, space="sell", optimize=True)
+    max_position_duration = IntParameter(12, 96, default=96, space="sell", optimize=True)  # in 5m candles (8 hours)
     
     # Safety parameters
     emergency_exit_profit = DecimalParameter(-0.05, -0.02, default=-0.03, space="sell")
