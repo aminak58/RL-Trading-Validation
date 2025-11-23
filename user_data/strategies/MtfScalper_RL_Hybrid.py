@@ -31,13 +31,14 @@ from freqtrade.strategy import (
 )
 from freqtrade.persistence import Trade
 
-# Import data collector
+# Import data collector and pipeline tracker
 import sys
 import os
 # Dynamic path resolution - works on any system
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 from user_data.data_collector import DataCollector
+from user_data.pipeline_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ class MtfScalper_RL_Hybrid(IStrategy):
                 "label_period_candles": 20,
                 "include_shifted_candles": 3,
                 "indicator_periods_candles": [10, 20, 50],
-                "DI_threshold": 0.9,
+                "DI_threshold": 0,  # FIXED: Set to 0 to preserve binary signal features
                 "weight_factor": 0.9,
                 "principal_component_analysis": False,
                 "use_SVM_to_remove_outliers": False,
@@ -400,38 +401,75 @@ class MtfScalper_RL_Hybrid(IStrategy):
         # 2. RL model can see classic entry signals during training
         # 3. Independent of execution order
 
-        # Classic LONG signal (same logic as populate_entry_trend)
-        classic_long_conditions = []
-        if all(col in dataframe.columns for col in ['rsi', 'ema_fast', 'ema_slow', 'adx']):
-            classic_long_conditions.append(dataframe['rsi'] < self.buy_rsi.value)
-            classic_long_conditions.append(dataframe['ema_fast'] > dataframe['ema_slow'])
-            classic_long_conditions.append(dataframe['adx'] > self.adx_thr_buy.value)
-            classic_long_conditions.append(dataframe['volume'] > 0)
+        # Classic LONG signal - EXACT same logic as populate_entry_trend
+        # Multi-timeframe alignment check
+        required_cols_5m = ['rsi', 'ema_fast', 'ema_slow', 'adx', 'close', 'open', 'atr', 'ema_trend']
+        required_cols_15m = ['ema_fast_15m', 'ema_slow_15m', 'adx_15m']
+        required_cols_1h = ['ema_fast_1h', 'ema_slow_1h', 'adx_1h']
 
-            if classic_long_conditions:
-                dataframe['%-classic_long_signal'] = (
-                    reduce(lambda x, y: x & y, classic_long_conditions)
-                ).astype(float)
-            else:
-                dataframe['%-classic_long_signal'] = 0.0
+        if (all(col in dataframe.columns for col in required_cols_5m) and
+            all(col in dataframe.columns for col in required_cols_15m) and
+            all(col in dataframe.columns for col in required_cols_1h)):
+
+            # Base timeframe (5m) conditions
+            main_trend_up = (
+                (dataframe["ema_fast"] > dataframe["ema_slow"]) &
+                (dataframe["close"] > dataframe["ema_trend"])
+            )
+            main_trend_down = (
+                (dataframe["ema_fast"] < dataframe["ema_slow"]) &
+                (dataframe["close"] < dataframe["ema_trend"])
+            )
+            main_strong_trend_buy = dataframe["adx"] > self.adx_thr_buy.value
+            main_strong_trend_sell = dataframe["adx"] > self.adx_thr_sell.value
+
+            # 15m confirmation
+            confirm_trend_up = dataframe["ema_fast_15m"] > dataframe["ema_slow_15m"]
+            confirm_trend_down = dataframe["ema_fast_15m"] < dataframe["ema_slow_15m"]
+            confirm_strong_trend_buy = dataframe["adx_15m"] > self.adx_thr_buy.value
+            confirm_strong_trend_sell = dataframe["adx_15m"] > self.adx_thr_sell.value
+
+            # 1h filter
+            filter_trend_up = dataframe["ema_fast_1h"] > dataframe["ema_slow_1h"]
+            filter_trend_down = dataframe["ema_fast_1h"] < dataframe["ema_slow_1h"]
+            filter_strong_trend_buy = dataframe["adx_1h"] > self.adx_thr_buy.value
+            filter_strong_trend_sell = dataframe["adx_1h"] > self.adx_thr_sell.value
+
+            # Perfect alignment across all timeframes
+            aligned_bullish = main_trend_up & confirm_trend_up & filter_trend_up
+            aligned_bearish = main_trend_down & confirm_trend_down & filter_trend_down
+
+            # Volatility Filter
+            atr_pct = (dataframe["atr"] / dataframe["close"]) * 100
+            volatility_filter = atr_pct < self.atr_threshold.value
+
+            # Final Buy Condition (EXACT match with populate_entry_trend)
+            buy_condition = (
+                aligned_bullish &
+                main_strong_trend_buy &
+                confirm_strong_trend_buy &
+                filter_strong_trend_buy &
+                (dataframe["rsi"] > self.buy_rsi.value) &
+                (dataframe["close"] > dataframe["open"]) &
+                volatility_filter
+            )
+
+            # Final Sell Condition (EXACT match with populate_entry_trend)
+            sell_condition = (
+                aligned_bearish &
+                main_strong_trend_sell &
+                confirm_strong_trend_sell &
+                filter_strong_trend_sell &
+                (dataframe["rsi"] < self.sell_rsi.value) &
+                (dataframe["close"] < dataframe["open"]) &
+                volatility_filter
+            )
+
+            dataframe['%-classic_long_signal'] = buy_condition.astype(float)
+            dataframe['%-classic_short_signal'] = sell_condition.astype(float)
         else:
+            # Fallback if required columns missing
             dataframe['%-classic_long_signal'] = 0.0
-
-        # Classic SHORT signal (same logic as populate_entry_trend)
-        classic_short_conditions = []
-        if all(col in dataframe.columns for col in ['rsi', 'ema_fast', 'ema_slow', 'adx']):
-            classic_short_conditions.append(dataframe['rsi'] > (100 - self.buy_rsi.value))
-            classic_short_conditions.append(dataframe['ema_fast'] < dataframe['ema_slow'])
-            classic_short_conditions.append(dataframe['adx'] > self.adx_thr_buy.value)
-            classic_short_conditions.append(dataframe['volume'] > 0)
-
-            if classic_short_conditions:
-                dataframe['%-classic_short_signal'] = (
-                    reduce(lambda x, y: x & y, classic_short_conditions)
-                ).astype(float)
-            else:
-                dataframe['%-classic_short_signal'] = 0.0
-        else:
             dataframe['%-classic_short_signal'] = 0.0
 
         # Combined signal indicator
@@ -439,6 +477,27 @@ class MtfScalper_RL_Hybrid(IStrategy):
             (dataframe['%-classic_long_signal'] == 1) |
             (dataframe['%-classic_short_signal'] == 1)
         ).astype(float)
+
+        # ═══════════════════════════════════════════════════════════
+        # PIPELINE TRACKER: Track classic signal generation
+        # ═══════════════════════════════════════════════════════════
+        try:
+            tracker = get_tracker()
+            # Track signals for the latest candle only
+            if len(dataframe) > 0:
+                tracker.track_classic_signal(
+                    candle_date=str(dataframe['date'].iloc[-1]),
+                    pair=metadata['pair'],
+                    long_signal=float(dataframe['%-classic_long_signal'].iloc[-1]),
+                    short_signal=float(dataframe['%-classic_short_signal'].iloc[-1]),
+                    metadata={
+                        'timeframe': period,
+                        'rsi': float(dataframe['rsi'].iloc[-1]) if 'rsi' in dataframe.columns else None,
+                        'adx': float(dataframe['adx'].iloc[-1]) if 'adx' in dataframe.columns else None
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Pipeline tracker failed in feature_engineering_expand_all: {e}")
 
         return dataframe
 
@@ -706,6 +765,22 @@ class MtfScalper_RL_Hybrid(IStrategy):
         if total_signals == 0:
             logger.warning(f"❌ NO CLASSIC SIGNALS: {metadata['pair']} - Entry conditions too restrictive")
 
+        # ═══════════════════════════════════════════════════════════
+        # PIPELINE TRACKER: Track strategy entry decision
+        # ═══════════════════════════════════════════════════════════
+        try:
+            tracker = get_tracker()
+            # Track entry decision for the latest candle
+            if len(dataframe) > 0:
+                tracker.track_strategy_decision(
+                    candle_date=str(dataframe['date'].iloc[-1]),
+                    pair=metadata['pair'],
+                    entry_signal=float(dataframe['enter_long'].iloc[-1] + dataframe['enter_short'].iloc[-1]),
+                    exit_signal=0.0
+                )
+        except Exception as e:
+            logger.warning(f"Pipeline tracker failed in populate_entry_trend: {e}")
+
         return dataframe
     
     # ═══════════════════════════════════════════════════════════
@@ -919,18 +994,23 @@ class MtfScalper_RL_Hybrid(IStrategy):
         if current_profit < self.emergency_exit_profit.value:
             exit_reason = "emergency_stop"
             # Log to data collector
-            self.data_collector.log_trade({
-                'pair': pair,
-                'exit_time': current_time,
-                'exit_price': current_rate,
-                'profit_abs': trade.calc_profit_abs(current_rate),
-                'profit_pct': current_profit,
-                'duration_candles': trade_duration_candles,
-                'is_short': trade.is_short,
-                'exit_reason': exit_reason,
-                'rl_action': 3 if not trade.is_short else 4,  # Emergency exit
-                'rl_confidence': 1.0,  # High confidence for safety
-            })
+            try:
+                # Calculate profit_abs manually (compatible with backtesting LocalTrade)
+                profit_abs = trade.stake_amount * current_profit if hasattr(trade, 'stake_amount') else 0.0
+                self.data_collector.log_trade({
+                    'pair': pair,
+                    'exit_time': current_time,
+                    'exit_price': current_rate,
+                    'profit_abs': profit_abs,
+                    'profit_pct': current_profit,
+                    'duration_candles': trade_duration_candles,
+                    'is_short': trade.is_short,
+                    'exit_reason': exit_reason,
+                    'rl_action': 3 if not trade.is_short else 4,  # Emergency exit
+                    'rl_confidence': 1.0,  # High confidence for safety
+                })
+            except Exception as e:
+                logger.debug(f"Error logging emergency exit: {e}")
             return exit_reason
 
         return None

@@ -22,13 +22,14 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-# Import data collector
+# Import data collector and pipeline tracker
 import sys
 import os
 # Dynamic path resolution - works on any system
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 from user_data.data_collector import DataCollector
+from user_data.pipeline_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ class MtfScalperRLModel(ReinforcementLearner):
 
         # Required RL attributes
         self.window_size = 30  # Default window size for observation
-        self.max_position_duration = 300  # Max 300 candles (25 hours)
+        self.max_position_duration = 96  # Aligned with config max_trade_duration_candles
 
         # Training parameters - OPTIMIZED FOR CPU
         self.learning_rate = kwargs.get('learning_rate', 3e-4)
@@ -227,21 +228,17 @@ class MtfScalperRLModel(ReinforcementLearner):
 
                 if not self._is_valid(action):
                     # Invalid entry (already in position)
-                    # REDUCED PENALTY: Was -10.0 which made model too risk-averse
-                    # Now just a gentle "no" signal to allow exploration
-                    return -1.0
+                    # Moderate penalty to discourage invalid actions
+                    return -2.0
 
                 if not classic_entry_signal:
-                    # Moderate penalty for entry without signal
-                    # REDUCED: Was -5.0, now -2.0 to encourage some exploration
-                    # Still negative to discourage random entries
-                    penalty = -2.0
-                    return penalty
+                    # REBALANCED: Entry without signal is discouraged but not heavily punished
+                    # Gradient ratio reduced from 87.5x to ~18x for better learning
+                    return -1.0
                 else:
-                    # HIGH REWARD: Entry with classic signal
-                    # Clear positive incentive to follow signals
-                    # Gradient: +15.0 (entry+signal) >> 0 (hold) > -2.0 (entry-no-signal) > -5.0 (hold+signal)
-                    return 15.0
+                    # REBALANCED: Entry with classic signal - strong but not extreme reward
+                    # Reduced from +25 to +10 for better gradient balance
+                    return 10.0
 
             # ═══════════════════════════════════════════════════════════
             # EXIT ACTION HANDLING (Main Focus)
@@ -267,14 +264,15 @@ class MtfScalperRLModel(ReinforcementLearner):
                     return holding_reward
                 else:
                     # Not in position - check for missed opportunity
+                    classic_entry_signal = self._check_classic_entry_signal()
                     if classic_entry_signal:
-                        # INCREASED PENALTY: Stronger opportunity cost to encourage taking signals
-                        # Was -2.0, now -5.0 to make holding with signal less attractive
-                        # This creates clear gradient: Entry+Signal(+15) >> Hold(-5)
+                        # REBALANCED: Missing a signal is penalized but proportionally
+                        # Gradient: Entry+Signal(+10) vs Hold+Signal(-5) = 15 units
                         return -5.0
                     else:
-                        # Neutral reward for waiting when no signal
-                        return 0.0  # No penalty for patience when no opportunity
+                        # REBALANCED: Slight negative to encourage action-taking
+                        # Gradient: Entry-Signal(-1) vs Hold-Signal(-0.2) = 0.8 units
+                        return -0.2
 
             # Small reward for any valid action to encourage exploration
             reward = 0.01
@@ -493,18 +491,22 @@ class MtfScalperRLModel(ReinforcementLearner):
             """
             if self.position_start_step is None:
                 return 0.0
-            
+
             # Position duration
             position_duration = self._current_tick - self.position_start_step
-            
-            # Reduced time penalty (more lenient for learning)
-            if position_duration > 500:  # Increased max duration
-                time_penalty = -3.0  # Reduced penalty
-            elif position_duration > 200:  # Extended grace period
-                time_penalty = -0.005 * (position_duration - 200)  # Smaller penalty
+
+            # Time penalty using max_position_duration from config (default 300)
+            # Uses percentage thresholds for consistency across different durations
+            max_dur = self.max_position_duration  # From config or default 300
+
+            if position_duration > max_dur * 0.8:  # 80% of max - strong penalty
+                time_penalty = -5.0
+            elif position_duration > max_dur * 0.4:  # 40% of max - gradual penalty
+                # Gradual penalty: -0.02 per candle beyond 40% threshold
+                time_penalty = -0.02 * (position_duration - max_dur * 0.4)
             else:
                 time_penalty = 0.0
-            
+
             # Profit tracking penalty (penalize if profit is deteriorating)
             if current_profit > self.max_profit_seen:
                 self.max_profit_seen = current_profit
@@ -513,31 +515,34 @@ class MtfScalperRLModel(ReinforcementLearner):
                 # Penalize for letting profit erode
                 profit_erosion = self.max_profit_seen - current_profit
                 profit_penalty = -10.0 * profit_erosion if profit_erosion > 0.01 else 0.0
-            
+
             return time_penalty + profit_penalty
         
         def _check_classic_entry_signal(self) -> bool:
             """
             Check if classic MtfScalper entry signal exists at current step
 
-            CRITICAL FIX: Now checks RL features (%-classic_*_signal) first
-            These features are available in the RL environment during training
-            The old approach (checking enter_long/enter_short) didn't work because
-            those columns don't exist in the RL environment's dataframe
+            CRITICAL FIX: Uses pattern matching to find signal features
+            FreqAI adds suffixes like _10_BTC/USDTUSDT_1h to feature names
+            So we search for any column containing 'classic_long_signal' etc.
             """
             if self._current_tick < 1:
                 return False
 
             current_row = self.df.iloc[self._current_tick]
 
-            # PRIMARY CHECK: Use RL features (available during training)
-            # These are created in feature_engineering_standard()
-            if "%-classic_long_signal" in current_row and current_row["%-classic_long_signal"] == 1:
-                return True
-            if "%-classic_short_signal" in current_row and current_row["%-classic_short_signal"] == 1:
-                return True
-            if "%-has_signal" in current_row and current_row["%-has_signal"] == 1:
-                return True
+            # PRIMARY CHECK: Pattern matching for RL features with any suffix
+            # FreqAI transforms "%-classic_long_signal" to "%-classic_long_signal_10_BTC/USDTUSDT_1h"
+            for col in current_row.index:
+                # Check for long signal (any timeframe/period suffix)
+                if 'classic_long_signal' in col and current_row[col] == 1:
+                    return True
+                # Check for short signal (any timeframe/period suffix)
+                if 'classic_short_signal' in col and current_row[col] == 1:
+                    return True
+                # Check for combined signal (any timeframe/period suffix)
+                if 'has_signal' in col and 'shift' not in col and current_row[col] == 1:
+                    return True
 
             # FALLBACK CHECK: Direct strategy signals (only in backtest mode)
             if "enter_long" in current_row and current_row["enter_long"] == 1:
@@ -707,6 +712,19 @@ class MtfScalperRLModel(ReinforcementLearner):
         self.actual_training_features = list(train_df.columns)
         logger.info(f"Training data shape: {train_df.shape}")
         logger.info(f"Stored {len(self.actual_training_features)} features for prediction consistency")
+
+        # DEBUG: Check classic signals in training data
+        if "%-classic_long_signal" in train_df.columns:
+            long_signals = (train_df["%-classic_long_signal"] == 1).sum()
+            short_signals = (train_df["%-classic_short_signal"] == 1).sum() if "%-classic_short_signal" in train_df.columns else 0
+            total_signals = long_signals + short_signals
+            signal_rate = total_signals / len(train_df) * 100
+            logger.info(f"🔍 DEBUG - Classic signals in training: Long={long_signals}, Short={short_signals}, Total={total_signals}")
+            logger.info(f"🔍 DEBUG - Signal rate: {signal_rate:.2f}% of {len(train_df)} candles")
+            if signal_rate < 1.0:
+                logger.warning(f"⚠️ WARNING: Low signal rate ({signal_rate:.2f}%) may cause HOLD-only behavior!")
+        else:
+            logger.error("❌ ERROR: No classic signal features found in training data!")
 
         # Prepare datasets with vectorized environments for CPU optimization
         # Try vectorized first, fallback to single env if fails
@@ -1088,6 +1106,27 @@ class MtfScalperRLModel(ReinforcementLearner):
                     actions.append(int(action))
                     confidences.append(confidence)
 
+                    # ═══════════════════════════════════════════════════════════
+                    # PIPELINE TRACKER: Track RL prediction and action
+                    # ═══════════════════════════════════════════════════════════
+                    try:
+                        tracker = get_tracker()
+                        # Map action to name
+                        action_names = {0: "HOLD", 1: "LONG_ENTER", 2: "SHORT_ENTER", 3: "LONG_EXIT", 4: "SHORT_EXIT"}
+                        action_name = action_names.get(int(action), "UNKNOWN")
+
+                        # Track RL prediction
+                        tracker.track_rl_prediction(
+                            candle_date=str(filtered_df.index[indices_buffer[-1]]),
+                            pair=dk.pair,
+                            prediction=float(action),
+                            confidence=float(confidence),
+                            action=int(action),
+                            action_name=action_name
+                        )
+                    except Exception as e:
+                        logger.debug(f"Pipeline tracker failed in predict: {e}")
+
                     obs, _, done, _, _ = pred_env.step(action)
                     if done:
                         obs, _ = pred_env.reset()
@@ -1143,5 +1182,22 @@ class MtfScalperRLModel(ReinforcementLearner):
 
         # Fill any missing values
         pred_df = pred_df.fillna(0)
+
+        # ═══════════════════════════════════════════════════════════
+        # PIPELINE TRACKER: Generate report at end of prediction
+        # ═══════════════════════════════════════════════════════════
+        try:
+            tracker = get_tracker()
+            report_path = tracker.generate_report(f"pipeline_{dk.pair.replace('/', '_')}")
+            logger.info(f"Pipeline tracking report generated: {report_path}")
+
+            # Log summary statistics
+            stats = tracker.get_stats()
+            logger.info(f"Pipeline Stats - Signals: {stats['classic_signals']}, "
+                       f"RL Predictions: {stats['rl_predictions']}, "
+                       f"RL Entry Actions: {stats['rl_entry_actions']}, "
+                       f"Trades: {stats['trades_executed']}")
+        except Exception as e:
+            logger.warning(f"Pipeline tracker report generation failed: {e}")
 
         return pred_df, dk.do_predict

@@ -3,7 +3,7 @@
     "margin_mode": "isolated",
     "max_open_trades": 3,
     "stake_currency": "USDT",
-    "stake_amount": 0.02,
+    "stake_amount": "unlimited",
     "tradable_balance_ratio": 0.99,
     "fiat_display_currency": "USD",
     "dry_run": false,
@@ -67,7 +67,7 @@
                 20,
                 50
             ],
-            "DI_threshold": 0.9,
+            "DI_threshold": 0,
             "weight_factor": 0.9,
             "principal_component_analysis": false,
             "use_SVM_to_remove_outliers": false,
@@ -91,17 +91,17 @@
             "shuffle": false
         },
         "rl_config": {
-            "train_cycles": 50,
+            "train_cycles": 150,
             "add_state_info": false,
             "max_trade_duration_candles": 96,
             "max_training_drawdown_pct": 0.15,
             "cpu_count": 8,
-            "n_envs": 8,
-            "n_steps": 4096,
-            "batch_size": 256,
+            "n_envs": 4,
+            "n_steps": 2048,
+            "batch_size": 512,
             "model_type": "PPO",
             "policy_type": "MlpPolicy",
-            "ent_coef": 0.1,
+            "ent_coef": 0.2,
             "net_arch": [
                 512,
                 512,
@@ -110,8 +110,8 @@
             "device": "auto",
             "model_reward_parameters": {
                 "rr": 1,
-                "profit_aim": 0.025,
-                "win_reward_factor": 2
+                "profit_aim": 0.03,
+                "win_reward_factor": 3
             },
             "drop_ohlc_from_features": false
         }
