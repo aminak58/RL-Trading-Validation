@@ -205,40 +205,52 @@ class MtfScalperRLModel(ReinforcementLearner):
         def calculate_reward(self, action: int) -> float:
             """
             Advanced reward function optimized for exit quality
-            
+
             Key Components:
             1. Profit/Loss component
             2. Drawdown control
             3. Exit timing quality
             4. Risk/Reward ratio
             5. Entry constraints (soft)
+
+            All rewards are normalized to [-1, +1] range for better PPO learning.
             """
-            
+
             # Get current state
             current_price = self.prices.iloc[self._current_tick]
             current_profit = self._calculate_current_profit()
-            
+
+            # Reward normalization constant (max absolute reward before scaling)
+            MAX_REWARD = 10.0
+
+            # Track reward components for logging
+            reward_type = "unknown"
+            raw_reward = 0.0
+            has_signal = False
+
             # ═══════════════════════════════════════════════════════════
             # ENTRY ACTION HANDLING (Soft Constraints)
             # ═══════════════════════════════════════════════════════════
-            
+
             if action in [Actions.Long_enter, Actions.Short_enter]:
-                # Check if classic entry signal exists
                 classic_entry_signal = self._check_classic_entry_signal()
+                has_signal = classic_entry_signal
 
                 if not self._is_valid(action):
-                    # Invalid entry (already in position)
-                    # Moderate penalty to discourage invalid actions
-                    return -2.0
-
-                if not classic_entry_signal:
-                    # REBALANCED: Entry without signal is discouraged but not heavily punished
-                    # Gradient ratio reduced from 87.5x to ~18x for better learning
-                    return -1.0
+                    reward_type = "invalid_entry"
+                    raw_reward = -2.0
+                elif not classic_entry_signal:
+                    reward_type = "entry_no_signal"
+                    raw_reward = -1.0
                 else:
-                    # REBALANCED: Entry with classic signal - strong but not extreme reward
-                    # Reduced from +25 to +10 for better gradient balance
-                    return 10.0
+                    reward_type = "entry_with_signal"
+                    raw_reward = 10.0
+
+                # Normalize and log
+                normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+                self._log_reward(action, reward_type, raw_reward, normalized_reward,
+                                current_profit, has_signal)
+                return normalized_reward
 
             # ═══════════════════════════════════════════════════════════
             # EXIT ACTION HANDLING (Main Focus)
@@ -246,10 +258,14 @@ class MtfScalperRLModel(ReinforcementLearner):
 
             if action in [Actions.Long_exit, Actions.Short_exit]:
                 if not self._is_valid(action):
-                    # Invalid exit (not in matching position)
-                    return -5.0
+                    reward_type = "invalid_exit"
+                    raw_reward = -5.0
+                    normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+                    self._log_reward(action, reward_type, raw_reward, normalized_reward,
+                                    current_profit, False)
+                    return normalized_reward
 
-                # Calculate multi-factor exit reward
+                # Calculate multi-factor exit reward (already returns normalized)
                 exit_reward = self._calculate_exit_quality_reward(current_profit)
                 return exit_reward
 
@@ -261,38 +277,59 @@ class MtfScalperRLModel(ReinforcementLearner):
                 if self._position != 0:
                     # In position - evaluate holding cost
                     holding_reward = self._calculate_holding_reward(current_profit)
+                    # Holding reward is already normalized in the function
                     return holding_reward
                 else:
                     # Not in position - check for missed opportunity
                     classic_entry_signal = self._check_classic_entry_signal()
+                    has_signal = classic_entry_signal
+
                     if classic_entry_signal:
-                        # REBALANCED: Missing a signal is penalized but proportionally
-                        # Gradient: Entry+Signal(+10) vs Hold+Signal(-5) = 15 units
-                        return -5.0
+                        reward_type = "hold_missed_signal"
+                        raw_reward = -5.0
                     else:
-                        # REBALANCED: Slight negative to encourage action-taking
-                        # Gradient: Entry-Signal(-1) vs Hold-Signal(-0.2) = 0.8 units
-                        return -0.2
+                        reward_type = "hold_no_signal"
+                        raw_reward = -0.2
 
-            # Small reward for any valid action to encourage exploration
-            reward = 0.01
+                    normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+                    self._log_reward(action, reward_type, raw_reward, normalized_reward,
+                                    current_profit, has_signal)
+                    return normalized_reward
 
-            # Log reward calculation if data collector available
+            # Fallback: Small reward for any valid action
+            reward_type = "fallback"
+            raw_reward = 0.01
+            normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+            self._log_reward(action, reward_type, raw_reward, normalized_reward,
+                            current_profit, False)
+            return normalized_reward
+
+        def _normalize_reward(self, reward: float, max_reward: float = 10.0) -> float:
+            """
+            Normalize reward to [-1, +1] range for better PPO learning.
+            Uses tanh-like clipping to preserve gradient near boundaries.
+            """
+            # Clip to [-max_reward, +max_reward] then scale to [-1, +1]
+            clipped = max(-max_reward, min(max_reward, reward))
+            return clipped / max_reward
+
+        def _log_reward(self, action: int, reward_type: str, raw_reward: float,
+                       normalized_reward: float, current_profit: float, has_signal: bool):
+            """Log reward calculation for debugging and analysis."""
             if self.data_collector:
                 try:
                     current_price = self.prices.iloc[self._current_tick]
-                    current_profit = self._calculate_current_profit()
-
                     self.data_collector.log_reward_calculation({
                         'timestamp': self._current_tick,
                         'pair': getattr(self, 'pair', 'unknown'),
                         'action': action,
-                        'total_reward': reward,
+                        'reward_type': reward_type,
+                        'raw_reward': raw_reward,
+                        'normalized_reward': normalized_reward,
+                        'total_reward': normalized_reward,
                         'components': {
-                            'profit_score': 0,
-                            'drawdown_score': 0,
-                            'timing_score': 0,
-                            'risk_reward_score': 0,
+                            'reward_type': reward_type,
+                            'has_signal': has_signal,
                         },
                         'weights': self.reward_weights,
                         'context': {
@@ -304,44 +341,51 @@ class MtfScalperRLModel(ReinforcementLearner):
                     })
                 except Exception as e:
                     logger.debug(f"Error logging reward: {e}")
-
-            return reward
         
         def _calculate_exit_quality_reward(self, current_profit: float) -> float:
             """
             Calculate multi-dimensional exit quality score
+            Returns normalized reward in [-1, +1] range
             """
-            
-            # Component 1: Profit Score (35%)
+            MAX_REWARD = 10.0
+
+            # Component 1: Profit Score (45%)
             profit_score = self._calculate_profit_score(current_profit)
-            
-            # Component 2: Drawdown Control (25%)
+
+            # Component 2: Drawdown Control (15%)
             drawdown_score = self._calculate_drawdown_score()
-            
+
             # Component 3: Timing Quality (20%)
             timing_score = self._calculate_timing_score()
-            
+
             # Component 4: Risk/Reward Ratio (20%)
             risk_reward_score = self._calculate_risk_reward_score(current_profit)
-            
-            # Weighted combination
-            total_reward = (
+
+            # Weighted combination (raw)
+            raw_reward = (
                 self.reward_weights["profit"] * profit_score +
                 self.reward_weights["drawdown_control"] * drawdown_score +
                 self.reward_weights["timing_quality"] * timing_score +
                 self.reward_weights["risk_reward_ratio"] * risk_reward_score
             )
 
-            # Log detailed reward breakdown if data collector available
+            # Normalize to [-1, +1]
+            normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+
+            # Log detailed reward breakdown
             if self.data_collector:
                 try:
                     current_price = self.prices.iloc[self._current_tick]
+                    position_duration = self._current_tick - self.position_start_step if self.position_start_step else 0
 
                     self.data_collector.log_reward_calculation({
                         'timestamp': self._current_tick,
                         'pair': getattr(self, 'pair', 'unknown'),
-                        'action': 'exit',  # This is called during exit
-                        'total_reward': total_reward,
+                        'action': 3 if self._position == 1 else 4,  # Long_exit or Short_exit
+                        'reward_type': 'exit',
+                        'raw_reward': raw_reward,
+                        'normalized_reward': normalized_reward,
+                        'total_reward': normalized_reward,
                         'components': {
                             'profit_score': profit_score,
                             'drawdown_score': drawdown_score,
@@ -352,7 +396,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                         'context': {
                             'position': self._position,
                             'profit': current_profit,
-                            'duration': self._current_tick - self.position_start_step if self.position_start_step else 0,
+                            'duration': position_duration,
                             'price': float(current_price),
                             'max_profit_seen': self.max_profit_seen,
                         },
@@ -360,7 +404,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                 except Exception as e:
                     logger.debug(f"Error logging exit reward: {e}")
 
-            return total_reward
+            return normalized_reward
         
         def _calculate_profit_score(self, profit: float) -> float:
             """
@@ -488,7 +532,10 @@ class MtfScalperRLModel(ReinforcementLearner):
             """
             Calculate reward for holding position
             Includes time decay to encourage timely exits
+            Returns normalized reward in [-1, +1] range
             """
+            MAX_REWARD = 10.0
+
             if self.position_start_step is None:
                 return 0.0
 
@@ -508,6 +555,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                 time_penalty = 0.0
 
             # Profit tracking penalty (penalize if profit is deteriorating)
+            profit_erosion = 0.0
             if current_profit > self.max_profit_seen:
                 self.max_profit_seen = current_profit
                 profit_penalty = 0.0
@@ -516,7 +564,42 @@ class MtfScalperRLModel(ReinforcementLearner):
                 profit_erosion = self.max_profit_seen - current_profit
                 profit_penalty = -10.0 * profit_erosion if profit_erosion > 0.01 else 0.0
 
-            return time_penalty + profit_penalty
+            raw_reward = time_penalty + profit_penalty
+            normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+
+            # Log holding reward components for debugging
+            if self.data_collector:
+                try:
+                    current_price = self.prices.iloc[self._current_tick]
+                    self.data_collector.log_reward_calculation({
+                        'timestamp': self._current_tick,
+                        'pair': getattr(self, 'pair', 'unknown'),
+                        'action': 0,  # Neutral/Hold
+                        'reward_type': 'hold_in_position',
+                        'raw_reward': raw_reward,
+                        'normalized_reward': normalized_reward,
+                        'total_reward': normalized_reward,
+                        'components': {
+                            'time_penalty': time_penalty,
+                            'profit_penalty': profit_penalty,
+                            'profit_erosion': profit_erosion,
+                            'position_duration': position_duration,
+                            'max_duration': max_dur,
+                            'duration_pct': position_duration / max_dur if max_dur > 0 else 0,
+                        },
+                        'weights': self.reward_weights,
+                        'context': {
+                            'position': self._position,
+                            'profit': current_profit,
+                            'max_profit_seen': self.max_profit_seen,
+                            'duration': position_duration,
+                            'price': float(current_price),
+                        },
+                    })
+                except Exception as e:
+                    logger.debug(f"Error logging holding reward: {e}")
+
+            return normalized_reward
         
         def _check_classic_entry_signal(self) -> bool:
             """
@@ -1085,17 +1168,20 @@ class MtfScalperRLModel(ReinforcementLearner):
             # Process batch when full or at end
             if len(obs_buffer) >= batch_size or i == len(filtered_df) - 1:
                 # Batch prediction
-                for obs_single in obs_buffer:
+                for idx_in_batch, obs_single in enumerate(obs_buffer):
                     action, _states = model.predict(obs_single, deterministic=True)
 
-                    # FIXED: Use actual model probabilities for confidence
-                    # Get action probabilities from policy network
+                    # ENHANCED: Extract full action probability distribution
+                    # This helps analyze model decision-making
+                    action_probs_list = [0.0] * 5  # 5 actions
                     try:
                         with th.no_grad():
                             obs_tensor = th.tensor(obs_single, dtype=th.float32).unsqueeze(0).to(model.device)
                             # Get distribution from policy
                             distribution = model.policy.get_distribution(obs_tensor)
                             action_probs = distribution.distribution.probs
+                            # Store full distribution
+                            action_probs_list = action_probs[0].cpu().tolist()
                             # Confidence is the probability of the selected action
                             confidence = float(action_probs[0, int(action)].item())
                     except Exception as e:
@@ -1107,7 +1193,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                     confidences.append(confidence)
 
                     # ═══════════════════════════════════════════════════════════
-                    # PIPELINE TRACKER: Track RL prediction and action
+                    # PIPELINE TRACKER: Track RL prediction with full distribution
                     # ═══════════════════════════════════════════════════════════
                     try:
                         tracker = get_tracker()
@@ -1115,14 +1201,16 @@ class MtfScalperRLModel(ReinforcementLearner):
                         action_names = {0: "HOLD", 1: "LONG_ENTER", 2: "SHORT_ENTER", 3: "LONG_EXIT", 4: "SHORT_EXIT"}
                         action_name = action_names.get(int(action), "UNKNOWN")
 
-                        # Track RL prediction
+                        # Track RL prediction with full action distribution
                         tracker.track_rl_prediction(
-                            candle_date=str(filtered_df.index[indices_buffer[-1]]),
+                            candle_date=str(filtered_df.index[indices_buffer[idx_in_batch]]),
                             pair=dk.pair,
                             prediction=float(action),
                             confidence=float(confidence),
                             action=int(action),
-                            action_name=action_name
+                            action_name=action_name,
+                            # NEW: Include full action probability distribution
+                            block_reason=f"probs:{action_probs_list}" if action_probs_list else None
                         )
                     except Exception as e:
                         logger.debug(f"Pipeline tracker failed in predict: {e}")
