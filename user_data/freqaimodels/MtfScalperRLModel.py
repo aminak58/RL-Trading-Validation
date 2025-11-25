@@ -526,37 +526,36 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         def _calculate_risk_reward_score(self, current_profit: float) -> float:
             """
-            Score based on risk/reward ratio achieved
+            Calculate risk/reward ratio score
+            Compares profit achieved vs maximum risk taken
             """
-            if self.position_start_step is None:
+            if self.position_start_step is None or self.position_start_price is None:
                 return 0.0
             
-            # Calculate maximum adverse excursion (risk taken)
-            position_prices = self.prices.iloc[self.position_start_step:self._current_tick + 1]
+            # Get prices during position
+            prices_in_position = self.prices.iloc[self.position_start_step:self._current_tick + 1]
             
-            if self._position == 1:  # Long
-                min_price = position_prices.min()
-                max_risk = (self.position_start_price - min_price) / self.position_start_price if self.position_start_price > 0 else 0
-            else:  # Short
-                max_price = position_prices.max()
-                max_risk = (max_price - self.position_start_price) / self.position_start_price if self.position_start_price > 0 else 0
+            # Extract scalar values
+            if self._position == self.Positions.Long:
+                # For long: max risk = lowest point
+                min_price_row = prices_in_position.min()
+                min_price = float(min_price_row.values[0]) if hasattr(min_price_row, 'values') else float(min_price_row)
+                max_risk = (self.position_start_price - min_price) / self.position_start_price
+            else:
+                # For short: max risk = highest point
+                max_price_row = prices_in_position.max()
+                max_price = float(max_price_row.values[0]) if hasattr(max_price_row, 'values') else float(max_price_row)
+                max_risk = (max_price - self.position_start_price) / self.position_start_price
             
-            # Calculate risk/reward ratio with epsilon protection
+            # Avoid division by zero
             if max_risk > 0:
-                # FIXED: Add epsilon protection to prevent division by zero/NaN
-                epsilon = 1e-10
-                risk_reward_ratio = current_profit / (max_risk + epsilon)
-                
-                if risk_reward_ratio > 3.0:  # Excellent R:R
-                    return 5.0
-                elif risk_reward_ratio > 2.0:  # Good R:R
-                    return 3.0
-                elif risk_reward_ratio > 1.0:  # Acceptable R:R
-                    return 1.0
-                else:  # Poor R:R
-                    return -2.0
+                risk_reward_ratio = current_profit / max_risk
+            else:
+                risk_reward_ratio = 0.0
             
-            return 0.0
+            # Score based on risk/reward ratio
+            # Good: 2:1 or better, Poor: 1:1 or worse
+            return max(-1.0, min(1.0, (risk_reward_ratio - 1.0) / 2.0))
         
         def _calculate_holding_reward(self, current_profit: float) -> float:
             """
