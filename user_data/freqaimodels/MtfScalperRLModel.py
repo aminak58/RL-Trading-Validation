@@ -486,8 +486,8 @@ class MtfScalperRLModel(ReinforcementLearner):
                 # For short: drawdown from lowest point
                 drawdown = (current_price - min_price) / min_price if min_price > 0 else 0
             
-            else:  # More than 2%
-                return -5.0 * drawdown
+            # Score: 1.0 for no drawdown, 0.0 for 10%+ drawdown
+            return max(0.0, 1.0 - (drawdown / 0.10))
         
         def _calculate_timing_score(self) -> float:
             """
