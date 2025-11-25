@@ -204,105 +204,116 @@ class MtfScalperRLModel(ReinforcementLearner):
             
         def calculate_reward(self, action: int) -> float:
             """
-            Advanced reward function optimized for exit quality
-
+            Simplified reward function focused on exit quality optimization
+            
+            ARCHITECTURE:
+            - Entry: Controlled by classic strategy (populate_entry_trend)
+            - Exit: Controlled by RL model (this reward function)
+            
+            DESIGN RATIONALE:
+            Signal features (%-classic_long_signal, etc.) are removed by 
+            VarianceThreshold before training. Previous reward logic that 
+            depended on these features was effectively dead code.
+            
+            New approach: Focus purely on exit quality metrics that ARE 
+            available (price, position, profit).
+            
             Key Components:
-            1. Profit/Loss component
-            2. Drawdown control
-            3. Exit timing quality
-            4. Risk/Reward ratio
-            5. Entry constraints (soft)
-
-            All rewards are normalized to [-1, +1] range for better PPO learning.
+            1. Exit quality (profit + timing + risk/reward)
+            2. Holding management (prevent zombie trades)
+            3. Invalid action penalties
+            
+            All rewards normalized to [-1, +1] range for stable PPO learning.
             """
 
             # Get current state
-            current_price = self.prices.iloc[self._current_tick]
             current_profit = self._calculate_current_profit()
-
-            # Reward normalization constant (max absolute reward before scaling)
             MAX_REWARD = 10.0
 
-            # Track reward components for logging
-            reward_type = "unknown"
-            raw_reward = 0.0
-            has_signal = False
-
             # ═══════════════════════════════════════════════════════════
-            # ENTRY ACTION HANDLING (Soft Constraints)
-            # ═══════════════════════════════════════════════════════════
-
-            if action in [Actions.Long_enter, Actions.Short_enter]:
-                classic_entry_signal = self._check_classic_entry_signal()
-                has_signal = classic_entry_signal
-
-                if not self._is_valid(action):
-                    reward_type = "invalid_entry"
-                    raw_reward = -2.0
-                elif not classic_entry_signal:
-                    reward_type = "entry_no_signal"
-                    raw_reward = -1.0
-                else:
-                    reward_type = "entry_with_signal"
-                    raw_reward = 10.0
-
-                # Normalize and log
-                normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
-                self._log_reward(action, reward_type, raw_reward, normalized_reward,
-                                current_profit, has_signal)
-                return normalized_reward
-
-            # ═══════════════════════════════════════════════════════════
-            # EXIT ACTION HANDLING (Main Focus)
+            # EXIT ACTIONS: Main Focus (RL-controlled)
             # ═══════════════════════════════════════════════════════════
 
             if action in [Actions.Long_exit, Actions.Short_exit]:
+                # Validate action
                 if not self._is_valid(action):
                     reward_type = "invalid_exit"
                     raw_reward = -5.0
                     normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
-                    self._log_reward(action, reward_type, raw_reward, normalized_reward,
-                                    current_profit, False)
+                    self._log_reward_simple(action, reward_type, raw_reward, 
+                                          normalized_reward, current_profit)
                     return normalized_reward
 
-                # Calculate multi-factor exit reward (already returns normalized)
+                # Calculate comprehensive exit quality score
+                # This includes: profit, timing, drawdown control, risk/reward
                 exit_reward = self._calculate_exit_quality_reward(current_profit)
                 return exit_reward
 
             # ═══════════════════════════════════════════════════════════
-            # HOLD ACTION
+            # HOLD ACTION: Position Management
             # ═══════════════════════════════════════════════════════════
 
             if action == Actions.Neutral:
-                if self._position != 0:
-                    # In position - evaluate holding cost
+                if self._position != Positions.Neutral:
+                    # In position: evaluate holding cost/benefit
                     holding_reward = self._calculate_holding_reward(current_profit)
-                    # Holding reward is already normalized in the function
                     return holding_reward
                 else:
-                    # Not in position - check for missed opportunity
-                    classic_entry_signal = self._check_classic_entry_signal()
-                    has_signal = classic_entry_signal
-
-                    if classic_entry_signal:
-                        reward_type = "hold_missed_signal"
-                        raw_reward = -5.0
-                    else:
-                        reward_type = "hold_no_signal"
-                        raw_reward = -0.2
-
+                    # Not in position: small negative encourages readiness
+                    # (but neutral since we can't force strategy to enter)
+                    reward_type = "hold_no_position"
+                    raw_reward = -0.1
                     normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
-                    self._log_reward(action, reward_type, raw_reward, normalized_reward,
-                                    current_profit, has_signal)
+                    self._log_reward_simple(action, reward_type, raw_reward,
+                                          normalized_reward, current_profit)
                     return normalized_reward
 
-            # Fallback: Small reward for any valid action
-            reward_type = "fallback"
-            raw_reward = 0.01
-            normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
-            self._log_reward(action, reward_type, raw_reward, normalized_reward,
-                            current_profit, False)
-            return normalized_reward
+            # ═══════════════════════════════════════════════════════════
+            # ENTRY ACTIONS: Not Used (Strategy Controls Entry)
+            # ═══════════════════════════════════════════════════════════
+
+            if action in [Actions.Long_enter, Actions.Short_enter]:
+                # These should not occur in practice since populate_entry_trend
+                # controls entry. If they do occur (e.g., during training simulation),
+                # return neutral reward.
+                logger.debug(f"RL attempted entry action {action} - ignoring "
+                           f"(entry controlled by strategy)")
+                return 0.0
+
+            # Fallback: Should never reach here
+            logger.warning(f"Unexpected action {action} in calculate_reward")
+            return 0.0
+
+        def _log_reward_simple(self, action: int, reward_type: str, raw_reward: float,
+                              normalized_reward: float, current_profit: float):
+            """Simplified reward logging without signal dependencies"""
+            if self.data_collector:
+                try:
+                    current_price = self.prices.iloc[self._current_tick]
+                    position_duration = (self._current_tick - self.position_start_step 
+                                       if self.position_start_step else 0)
+                    
+                    self.data_collector.log_reward_calculation({
+                        'timestamp': self._current_tick,
+                        'pair': getattr(self, 'pair', 'unknown'),
+                        'action': action,
+                        'reward_type': reward_type,
+                        'raw_reward': raw_reward,
+                        'normalized_reward': normalized_reward,
+                        'total_reward': normalized_reward,
+                        'components': {
+                            'reward_type': reward_type,
+                        },
+                        'weights': self.reward_weights,
+                        'context': {
+                            'position': self._position,
+                            'profit': current_profit,
+                            'duration': position_duration,
+                            'price': float(current_price),
+                        },
+                    })
+                except Exception as e:
+                    logger.debug(f"Error logging reward: {e}")
 
         def _normalize_reward(self, reward: float, max_reward: float = 10.0) -> float:
             """
