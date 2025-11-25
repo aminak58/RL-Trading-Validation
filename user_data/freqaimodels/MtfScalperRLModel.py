@@ -229,12 +229,19 @@ class MtfScalperRLModel(ReinforcementLearner):
             # Get current state
             current_profit = self._calculate_current_profit()
             MAX_REWARD = 10.0
+            
+            # DEBUG: Log action received
+            if self._current_tick % 100 == 0 or action in [2, 4]:  # Log exits and every 100 ticks
+                logger.info(f"[REWARD DEBUG] tick={self._current_tick}, action={action}, "
+                          f"position={self._position}, profit={current_profit:.4f}")
 
             # ═══════════════════════════════════════════════════════════
             # EXIT ACTIONS: Main Focus (RL-controlled)
             # ═══════════════════════════════════════════════════════════
 
-            if action in [Actions.Long_exit, Actions.Short_exit]:
+            # Note: action is passed as int (0-4), not Actions enum
+            # Actions mapping: 0=Neutral, 1=Long_enter, 2=Long_exit, 3=Short_enter, 4=Short_exit
+            if action in [Actions.Long_exit.value, Actions.Short_exit.value]:  # 2, 4
                 # Validate action
                 if not self._is_valid(action):
                     reward_type = "invalid_exit"
@@ -247,23 +254,30 @@ class MtfScalperRLModel(ReinforcementLearner):
                 # Calculate comprehensive exit quality score
                 # This includes: profit, timing, drawdown control, risk/reward
                 exit_reward = self._calculate_exit_quality_reward(current_profit)
+                logger.info(f"[EXIT REWARD] tick={self._current_tick}, action={action}, "
+                          f"profit={current_profit:.4f}, reward={exit_reward:.4f}")
                 return exit_reward
 
             # ═══════════════════════════════════════════════════════════
             # HOLD ACTION: Position Management
             # ═══════════════════════════════════════════════════════════
 
-            if action == Actions.Neutral:
-                if self._position != Positions.Neutral:
+            elif action == Actions.Neutral.value:  # 0
+                if self._position != 0:  # In position (1 or -1)
                     # In position: evaluate holding cost/benefit
                     holding_reward = self._calculate_holding_reward(current_profit)
+                    if self._current_tick % 100 == 0:
+                        logger.debug(f"[HOLD IN POSITION] tick={self._current_tick}, "
+                                   f"profit={current_profit:.4f}, reward={holding_reward:.4f}")
                     return holding_reward
-                else:
+                else:  # Not in position
                     # Not in position: small negative encourages readiness
                     # (but neutral since we can't force strategy to enter)
                     reward_type = "hold_no_position"
                     raw_reward = -0.1
                     normalized_reward = self._normalize_reward(raw_reward, MAX_REWARD)
+                    if self._current_tick % 500 == 0:
+                        logger.debug(f"[HOLD NO POSITION] tick={self._current_tick}, reward={normalized_reward:.4f}")
                     self._log_reward_simple(action, reward_type, raw_reward,
                                           normalized_reward, current_profit)
                     return normalized_reward
@@ -272,17 +286,17 @@ class MtfScalperRLModel(ReinforcementLearner):
             # ENTRY ACTIONS: Not Used (Strategy Controls Entry)
             # ═══════════════════════════════════════════════════════════
 
-            if action in [Actions.Long_enter, Actions.Short_enter]:
+            elif action in [Actions.Long_enter.value, Actions.Short_enter.value]:  # 1, 3
                 # These should not occur in practice since populate_entry_trend
                 # controls entry. If they do occur (e.g., during training simulation),
                 # return neutral reward.
-                logger.debug(f"RL attempted entry action {action} - ignoring "
-                           f"(entry controlled by strategy)")
+                logger.info(f"[ENTRY ACTION] tick={self._current_tick}, action={action} - ignored")
                 return 0.0
 
             # Fallback: Should never reach here
-            logger.warning(f"Unexpected action {action} in calculate_reward")
-            return 0.0
+            else:
+                logger.warning(f"Unexpected action {action} in calculate_reward")
+                return 0.0
 
         def _log_reward_simple(self, action: int, reward_type: str, raw_reward: float,
                               normalized_reward: float, current_profit: float):
@@ -619,56 +633,12 @@ class MtfScalperRLModel(ReinforcementLearner):
             UPDATED: Uses rolling signal counts instead of binary signals
             Binary signals get REMOVED by VarianceThreshold due to low variance.
             Rolling counts survive filtering and indicate recent signal activity.
+            
+            [DEPRECATED 2024-11-25]
+            This method is no longer used in reward calculation.
+            Always returns False since signal features are filtered out.
             """
-            if self._current_tick < 1:
-                return False
-
-            current_row = self.df.iloc[self._current_tick]
-            prev_row = self.df.iloc[self._current_tick - 1]
-
-            # PRIMARY CHECK: Rolling signal count increase
-            # If count increased, a new signal appeared recently
-            long_count = current_row.get('%-signal_count_long_10', 0)
-            short_count = current_row.get('%-signal_count_short_10', 0)
-            long_count_prev = prev_row.get('%-signal_count_long_10', 0)
-            short_count_prev = prev_row.get('%-signal_count_short_10', 0)
-            
-            # Signal detected if count increased (new signal in last 10 candles)
-            if long_count > long_count_prev or short_count > short_count_prev:
-                return True
-            
-            # SECONDARY CHECK: Signal strength above threshold
-            # Even without new signal, strong conditions might warrant entry
-            signal_strength_long = current_row.get('%-signal_strength_long', 0)
-            signal_strength_short = current_row.get('%-signal_strength_short', 0)
-            
-            # Threshold: 0.3 is moderate strength (30% of max)
-            if signal_strength_long > 0.3 or signal_strength_short > 0.3:
-                return True
-
-            # FALLBACK CHECK: Pattern matching for any remaining binary signals
-            # (These might be filtered out, but check anyway for backward compatibility)
-            for col in current_row.index:
-                if 'classic_long_signal' in col and current_row[col] == 1:
-                    return True
-                if 'classic_short_signal' in col and current_row[col] == 1:
-                    return True
-                if 'has_signal' in col and 'shift' not in col and current_row[col] == 1:
-                    return True
-
-            # FALLBACK CHECK: Direct strategy signals (only in backtest mode)
-            if "enter_long" in current_row and current_row["enter_long"] == 1:
-                return True
-            if "enter_short" in current_row and current_row["enter_short"] == 1:
-                return True
-
-            # FALLBACK CHECK: Strategy entry tags (Freqtrade format)
-            if "enter_tag" in current_row:
-                enter_tag = current_row["enter_tag"]
-                if pd.notna(enter_tag) and enter_tag in ["enter_long", "enter_short"]:
-                    return True
-
-            # No signal detected
+            logger.debug("_check_classic_entry_signal() deprecated - returns False")
             return False
         
         def _calculate_current_profit(self) -> float:
@@ -686,25 +656,67 @@ class MtfScalperRLModel(ReinforcementLearner):
         def step(self, action: int) -> Tuple:
             """
             Override step to track position information and log data
+            
+            CRITICAL FIX: Position tracking must happen AFTER super().step()
+            because that's when _position actually changes!
+            
+            DEEP DEBUG: Added comprehensive logging to understand tracking failure
             """
-            # Get current state before action
-            current_price = self.prices.iloc[self._current_tick]
-            current_profit = self._calculate_current_profit()
-
-            # Track position entry
-            if self._position == 0 and action in [Actions.Long_enter, Actions.Short_enter]:
-                self.position_start_price = self.prices.iloc[self._current_tick]
-                self.position_start_step = self._current_tick
+            # Store old position state BEFORE calling parent
+            old_position = self._position
+            old_start_price = self.position_start_price
+            
+            # DEBUG: Log state BEFORE parent step
+            logger.info(f"[DEBUG BEFORE] tick={self._current_tick}, action={action}, "
+                       f"old_pos={old_position} (type={type(old_position).__name__}), "
+                       f"start_price={old_start_price}")
+            
+            # Call parent step FIRST - this executes action and changes position
+            obs, reward, done, truncated, info = super().step(action)
+            
+            # DEBUG: Log state AFTER parent step
+            new_position = self._position
+            logger.info(f"[DEBUG AFTER] tick={self._current_tick}, action={action}, "
+                       f"new_pos={new_position} (type={type(new_position).__name__}), "
+                       f"reward={reward:.4f}")
+            
+            # DEBUG: Log transition detection logic
+            from freqtrade.freqai.RL.Base5ActionRLEnv import Positions
+            entry_condition = (old_position == Positions.Neutral and new_position != Positions.Neutral)
+            exit_condition = (old_position != Positions.Neutral and new_position == Positions.Neutral)
+            logger.info(f"[DEBUG TRANSITION] old==Neutral? {old_position==Positions.Neutral}, "
+                       f"new!=Neutral? {new_position!=Positions.Neutral}, "
+                       f"entry? {entry_condition}, exit? {exit_condition}")
+            
+            # NOW track position changes (old vs new position)
+            # Entry: just entered position (old=Neutral, new!=Neutral)
+            if entry_condition:
+                # Extract scalar price - self.prices.iloc returns a row
+                # Get first value (assuming single column or use .values[0])
+                price_row = self.prices.iloc[self._current_tick - 1]
+                entry_price = float(price_row.values[0]) if hasattr(price_row, 'values') else float(price_row)
+                self.position_start_price = entry_price
+                self.position_start_step = self._current_tick - 1
                 self.max_profit_seen = 0.0
-
-            # Track position exit
-            elif self._position != 0 and action in [Actions.Long_exit, Actions.Short_exit]:
+                logger.info(f"[ENTRY TRACKED] tick={self._current_tick-1}, pos={self._position}, "
+                           f"entry_price={entry_price:.4f}")
+            
+            # Exit: just exited position (old!=0, new=0)
+            elif exit_condition:
+                if self.position_start_price:
+                    # Calculate final profit before clearing
+                    current_price = self.prices.iloc[self._current_tick - 1]
+                    if old_position == 1:  # Was long
+                        final_profit = (current_price - self.position_start_price) / self.position_start_price
+                    else:  # Was short
+                        final_profit = (self.position_start_price - current_price) / self.position_start_price
+                    logger.info(f"[EXIT TRACKED] tick={self._current_tick}, old_pos={old_position}, "
+                               f"final_profit={final_profit:.4f}")
+                else:
+                    logger.warning(f"[EXIT WARNING] Position exited but start_price was None!")
                 self.position_start_price = None
                 self.position_start_step = None
                 self.max_profit_seen = 0.0
-
-            # Call parent step
-            obs, reward, done, truncated, info = super().step(action)
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # CRITICAL FIX: Simulate custom_exit() logic during training
@@ -1084,6 +1096,10 @@ class MtfScalperRLModel(ReinforcementLearner):
         }
 
         env = self.MtfScalperRLEnv(**env_config)
+        
+        # DEBUG: Log environment creation
+        logger.info(f"[ENV CREATE] pair={pair}, is_train={is_train}, "
+                   f"df_len={len(df)}, window_size={self.window_size}")
 
         # Set data_collector after environment creation (bypasses BaseEnvironment validation)
         if data_collector:
@@ -1092,6 +1108,9 @@ class MtfScalperRLModel(ReinforcementLearner):
         if is_train:
             # Wrap in monitor for training
             env = Monitor(env)
+            logger.info(f"[TRAINING MODE] Environment wrapped in Monitor for training")
+        else:
+            logger.info(f"[PREDICTION MODE] Environment in prediction mode (no Monitor)")
 
         return env
     
