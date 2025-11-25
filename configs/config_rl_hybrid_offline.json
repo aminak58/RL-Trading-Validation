@@ -1,0 +1,150 @@
+{
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "max_open_trades": 3,
+    "stake_currency": "USDT",
+    "stake_amount": "unlimited",
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "dry_run_wallet": 10000,
+    "cancel_open_orders_on_exit": false,
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "skip_pair_validation": true,
+        "ccxt_config": {
+            "enableRateLimit": false,
+            "options": {
+                "defaultType": "future"
+            }
+        },
+        "ccxt_async_config": {
+            "enableRateLimit": false
+        },
+        "pair_whitelist": [
+            "BTC/USDT:USDT"
+        ],
+        "pair_blacklist": []
+    },
+    "dataprovider": {
+        "data_source": "local"
+    },
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": false,
+        "order_book_top": 1,
+        "check_depth_of_market": {
+            "enabled": false
+        }
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": false,
+        "order_book_top": 1
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "edge": {
+        "enabled": false
+    },
+    "freqai": {
+        "enabled": true,
+        "purge_old_models": 2,
+        "train_period_days": 30,
+        "backtest_period_days": 10,
+        "live_retrain_hours": 0,
+        "identifier": "MtfScalperRL_v2",
+        "feature_parameters": {
+            "include_timeframes": [
+                "5m",
+                "15m",
+                "1h"
+            ],
+            "include_corr_pairlist": [],
+            "label_period_candles": 20,
+            "include_shifted_candles": 3,
+            "indicator_periods_candles": [
+                10,
+                20,
+                50
+            ],
+            "DI_threshold": 0,
+            "weight_factor": 0.9,
+            "principal_component_analysis": false,
+            "use_SVM_to_remove_outliers": false,
+            "svm_params": {
+                "shuffle": false,
+                "nu": 0.1
+            },
+            "use_DBSCAN_to_remove_outliers": false,
+            "inlier_metric_window": 0,
+            "noise_standard_deviation": 0.05,
+            "data_split_parameters": {
+                "test_size": 0.15,
+                "random_state": 42,
+                "shuffle": false
+            },
+            "stratify_training_data": 0
+        },
+        "data_split_parameters": {
+            "test_size": 0.15,
+            "random_state": 42,
+            "shuffle": false
+        },
+        "rl_config": {
+            "train_cycles": 150,
+            "add_state_info": false,
+            "max_trade_duration_candles": 96,
+            "max_training_drawdown_pct": 0.15,
+            "cpu_count": 8,
+            "n_envs": 4,
+            "n_steps": 2048,
+            "batch_size": 512,
+            "model_type": "PPO",
+            "policy_type": "MlpPolicy",
+            "ent_coef": 0.2,
+            "net_arch": [
+                512,
+                512,
+                256
+            ],
+            "device": "auto",
+            "model_reward_parameters": {
+                "rr": 1,
+                "profit_aim": 0.03,
+                "win_reward_factor": 3
+            },
+            "drop_ohlc_from_features": false
+        }
+    },
+    "telegram": {
+        "enabled": false
+    },
+    "api_server": {
+        "enabled": false
+    },
+    "bot_name": "MtfScalperRL_Colab",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "internals": {
+        "process_throttle_secs": 5
+    },
+    "strategy": "MtfScalper_RL_Hybrid",
+    "strategy_path": "user_data.strategies.MtfScalper_RL_Hybrid",
+    "freqaimodel": "MtfScalperRLModel",
+    "freqaimodel_path": "user_data.freqaimodels.MtfScalperRLModel",
+    "dataformat_ohlcv": "feather",
+    "datadir": "user_data/data/binance",
+    "user_data_dir": "user_data"
+}
