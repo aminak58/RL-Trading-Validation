@@ -392,16 +392,40 @@ class MtfScalper_RL_Hybrid(IStrategy):
             dataframe["%-trend_age"] = 0
 
         # ═══════════════════════════════════════════════════════════
-        # CRITICAL FIX: CLASSIC ENTRY SIGNALS AS RL FEATURES
+        # NOTE: Classic signals now calculated in feature_engineering_standard()
         # ═══════════════════════════════════════════════════════════
-        # Problem: feature_engineering_standard() runs BEFORE populate_entry_trend()
-        # Solution: Calculate classic signals HERE using same logic as populate_entry_trend()
-        # This ensures:
-        # 1. Signals have variance (real calculation, not copy from non-existent columns)
-        # 2. RL model can see classic entry signals during training
-        # 3. Independent of execution order
+        # Signals are created BEFORE VarianceThreshold filtering to prevent removal
+        # Nothing to do here - signals already exist as %-classic_long_signal, %-classic_short_signal, %-has_signal
 
-        # Classic LONG signal - EXACT same logic as populate_entry_trend
+        # Pipeline tracker moved to feature_engineering_standard()
+        # where signals are guaranteed to exist
+
+        return dataframe
+
+    def feature_engineering_standard(self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
+        """
+        Standard feature engineering required for RL models.
+        Includes raw price data that RL environment needs for price access.
+
+        CRITICAL: Classic signal features MUST be calculated HERE (not in expand_all)
+        because FreqAI's VarianceThreshold runs BETWEEN standard and expand_all.
+        Binary signals (0/1) with low variance get filtered out if added after.
+        """
+
+        # CRITICAL: Raw price data for RL environment (FreqAI standard requirement)
+        # These are ONLY created here, not duplicated elsewhere
+        dataframe["%-raw_close"] = dataframe["close"]
+        dataframe["%-raw_open"] = dataframe["open"]
+        dataframe["%-raw_high"] = dataframe["high"]
+        dataframe["%-raw_low"] = dataframe["low"]
+        dataframe["%-raw_volume"] = dataframe["volume"]
+
+        # ═══════════════════════════════════════════════════════════
+        # CRITICAL: CLASSIC ENTRY SIGNALS AS RL FEATURES
+        # ═══════════════════════════════════════════════════════════
+        # Must calculate HERE (before VarianceThreshold filtering)
+        # Otherwise binary signals get removed by DI_threshold
+
         # Multi-timeframe alignment check
         required_cols_5m = ['rsi', 'ema_fast', 'ema_slow', 'adx', 'close', 'open', 'atr', 'ema_trend']
         required_cols_15m = ['ema_fast_15m', 'ema_slow_15m', 'adx_15m']
@@ -481,42 +505,89 @@ class MtfScalper_RL_Hybrid(IStrategy):
         # ═══════════════════════════════════════════════════════════
         # PIPELINE TRACKER: Track classic signal generation
         # ═══════════════════════════════════════════════════════════
+        # MOVED HERE: Signals are now created above, so tracking is reliable
         try:
             tracker = get_tracker()
             # Track signals for the latest candle only
             if len(dataframe) > 0:
+                latest_idx = -1
                 tracker.track_classic_signal(
-                    candle_date=str(dataframe['date'].iloc[-1]),
+                    candle_date=str(dataframe['date'].iloc[latest_idx]),
                     pair=metadata['pair'],
-                    long_signal=float(dataframe['%-classic_long_signal'].iloc[-1]),
-                    short_signal=float(dataframe['%-classic_short_signal'].iloc[-1]),
+                    long_signal=float(dataframe['%-classic_long_signal'].iloc[latest_idx]),
+                    short_signal=float(dataframe['%-classic_short_signal'].iloc[latest_idx]),
                     metadata={
-                        'timeframe': period,
-                        'rsi': float(dataframe['rsi'].iloc[-1]) if 'rsi' in dataframe.columns else None,
-                        'adx': float(dataframe['adx'].iloc[-1]) if 'adx' in dataframe.columns else None
+                        'timeframe': '5m',  # This is the base timeframe in standard()
+                        'rsi': float(dataframe['rsi'].iloc[latest_idx]) if 'rsi' in dataframe.columns else None,
+                        'adx': float(dataframe['adx'].iloc[latest_idx]) if 'adx' in dataframe.columns else None,
+                        # NEW: Include high-variance proxy features for analysis
+                        'signal_count_long_10': float(dataframe.get('%-signal_count_long_10', pd.Series([0])).iloc[latest_idx]) if '%-signal_count_long_10' in dataframe.columns else 0,
+                        'signal_count_short_10': float(dataframe.get('%-signal_count_short_10', pd.Series([0])).iloc[latest_idx]) if '%-signal_count_short_10' in dataframe.columns else 0,
+                        'signal_strength_long': float(dataframe.get('%-signal_strength_long', pd.Series([0])).iloc[latest_idx]) if '%-signal_strength_long' in dataframe.columns else 0,
+                        'signal_strength_short': float(dataframe.get('%-signal_strength_short', pd.Series([0])).iloc[latest_idx]) if '%-signal_strength_short' in dataframe.columns else 0,
+                        'candles_since_long': float(dataframe.get('%-candles_since_long', pd.Series([999])).iloc[latest_idx]) if '%-candles_since_long' in dataframe.columns else 999,
+                        'candles_since_short': float(dataframe.get('%-candles_since_short', pd.Series([999])).iloc[latest_idx]) if '%-candles_since_short' in dataframe.columns else 999,
                     }
                 )
         except Exception as e:
-            logger.warning(f"Pipeline tracker failed in feature_engineering_expand_all: {e}")
+            logger.debug(f"Pipeline tracker failed in feature_engineering_standard: {e}")
 
-        return dataframe
-
-    def feature_engineering_standard(self, dataframe: DataFrame, metadata: Dict, **kwargs) -> DataFrame:
-        """
-        Standard feature engineering required for RL models.
-        Includes raw price data that RL environment needs for price access.
-
-        NOTE: Classic signal features are now calculated in feature_engineering_expand_all()
-        to avoid execution order issues (expand_all runs after populate_indicators).
-        """
-
-        # CRITICAL: Raw price data for RL environment (FreqAI standard requirement)
-        # These are ONLY created here, not duplicated elsewhere
-        dataframe["%-raw_close"] = dataframe["close"]
-        dataframe["%-raw_open"] = dataframe["open"]
-        dataframe["%-raw_high"] = dataframe["high"]
-        dataframe["%-raw_low"] = dataframe["low"]
-        dataframe["%-raw_volume"] = dataframe["volume"]
+        # ═══════════════════════════════════════════════════════════
+        # CRITICAL FIX: High-Variance Signal Proxy Features
+        # ═══════════════════════════════════════════════════════════
+        # Binary signals (%-classic_long_signal, %-classic_short_signal) get
+        # REMOVED by VarianceThreshold due to low variance (~0.2% signals).
+        # Solution: Create continuous/aggregated features with higher variance
+        
+        # Create float versions for aggregation
+        buy_signal_float = dataframe['%-classic_long_signal'].copy()
+        sell_signal_float = dataframe['%-classic_short_signal'].copy()
+        
+        # 1. Rolling Signal Counts (Variance: ~0.5-1.5)
+        # Counts signals in recent windows - immune to VarianceThreshold
+        dataframe['%-signal_count_long_10'] = buy_signal_float.rolling(10, min_periods=1).sum()
+        dataframe['%-signal_count_short_10'] = sell_signal_float.rolling(10, min_periods=1).sum()
+        dataframe['%-signal_count_long_50'] = buy_signal_float.rolling(50, min_periods=1).sum()
+        dataframe['%-signal_count_short_50'] = sell_signal_float.rolling(50, min_periods=1).sum()
+        
+        # 2. Continuous Signal Strength (Variance: ~0.15-0.30)
+        # Combines indicators into a continuous measure instead of binary 0/1
+        if 'adx' in dataframe.columns and 'rsi' in dataframe.columns:
+            # Long strength: Higher when bullish conditions are stronger
+            dataframe['%-signal_strength_long'] = (
+                (dataframe['adx'] / 100) *  # 0.0 - 1.0
+                (dataframe['rsi'] / 100) *  # 0.0 - 1.0
+                ((dataframe['ema_fast'] / dataframe['ema_slow']).clip(0.95, 1.05) - 0.95) * 10  # trend strength
+            ).fillna(0)
+            
+            # Short strength: Higher when bearish conditions are stronger  
+            dataframe['%-signal_strength_short'] = (
+                (dataframe['adx'] / 100) *
+                ((100 - dataframe['rsi']) / 100) *  # inverse RSI
+                ((dataframe['ema_slow'] / dataframe['ema_fast']).clip(0.95, 1.05) - 0.95) * 10
+            ).fillna(0)
+        else:
+            dataframe['%-signal_strength_long'] = 0.0
+            dataframe['%-signal_strength_short'] = 0.0
+        
+        # 3. Candles Since Last Signal (Variance: ~50-200)
+        # Measures recency of signals - very high variance
+        def candles_since_signal(signal_series):
+            """Calculate candles since last signal occurrence"""
+            # Counter that resets when signal appears
+            result = signal_series.eq(0).groupby(signal_series.ne(0).cumsum()).cumcount()
+            # Forward fill to maintain count, use 999 for "never signaled"
+            return result.where(result > 0, pd.Series([999] * len(result), index=signal_series.index)).ffill().fillna(999)
+        
+        dataframe['%-candles_since_long'] = candles_since_signal(buy_signal_float)
+        dataframe['%-candles_since_short'] = candles_since_signal(sell_signal_float)
+        
+        # Log summary for debugging
+        logger.info(f"✅ Added high-variance signal features:")
+        logger.info(f"   - Rolling counts (10, 50 candles)")
+        logger.info(f"   - Continuous strength scores")
+        logger.info(f"   - Candles since last signal")
+        logger.info(f"   These should SURVIVE VarianceThreshold filtering!")
 
         return dataframe
 

@@ -605,25 +605,43 @@ class MtfScalperRLModel(ReinforcementLearner):
             """
             Check if classic MtfScalper entry signal exists at current step
 
-            CRITICAL FIX: Uses pattern matching to find signal features
-            FreqAI adds suffixes like _10_BTC/USDTUSDT_1h to feature names
-            So we search for any column containing 'classic_long_signal' etc.
+            UPDATED: Uses rolling signal counts instead of binary signals
+            Binary signals get REMOVED by VarianceThreshold due to low variance.
+            Rolling counts survive filtering and indicate recent signal activity.
             """
             if self._current_tick < 1:
                 return False
 
             current_row = self.df.iloc[self._current_tick]
+            prev_row = self.df.iloc[self._current_tick - 1]
 
-            # PRIMARY CHECK: Pattern matching for RL features with any suffix
-            # FreqAI transforms "%-classic_long_signal" to "%-classic_long_signal_10_BTC/USDTUSDT_1h"
+            # PRIMARY CHECK: Rolling signal count increase
+            # If count increased, a new signal appeared recently
+            long_count = current_row.get('%-signal_count_long_10', 0)
+            short_count = current_row.get('%-signal_count_short_10', 0)
+            long_count_prev = prev_row.get('%-signal_count_long_10', 0)
+            short_count_prev = prev_row.get('%-signal_count_short_10', 0)
+            
+            # Signal detected if count increased (new signal in last 10 candles)
+            if long_count > long_count_prev or short_count > short_count_prev:
+                return True
+            
+            # SECONDARY CHECK: Signal strength above threshold
+            # Even without new signal, strong conditions might warrant entry
+            signal_strength_long = current_row.get('%-signal_strength_long', 0)
+            signal_strength_short = current_row.get('%-signal_strength_short', 0)
+            
+            # Threshold: 0.3 is moderate strength (30% of max)
+            if signal_strength_long > 0.3 or signal_strength_short > 0.3:
+                return True
+
+            # FALLBACK CHECK: Pattern matching for any remaining binary signals
+            # (These might be filtered out, but check anyway for backward compatibility)
             for col in current_row.index:
-                # Check for long signal (any timeframe/period suffix)
                 if 'classic_long_signal' in col and current_row[col] == 1:
                     return True
-                # Check for short signal (any timeframe/period suffix)
                 if 'classic_short_signal' in col and current_row[col] == 1:
                     return True
-                # Check for combined signal (any timeframe/period suffix)
                 if 'has_signal' in col and 'shift' not in col and current_row[col] == 1:
                     return True
 
@@ -796,18 +814,43 @@ class MtfScalperRLModel(ReinforcementLearner):
         logger.info(f"Training data shape: {train_df.shape}")
         logger.info(f"Stored {len(self.actual_training_features)} features for prediction consistency")
 
-        # DEBUG: Check classic signals in training data
-        if "%-classic_long_signal" in train_df.columns:
-            long_signals = (train_df["%-classic_long_signal"] == 1).sum()
-            short_signals = (train_df["%-classic_short_signal"] == 1).sum() if "%-classic_short_signal" in train_df.columns else 0
+        # DEBUG: Check classic signals in training data using pattern matching
+        # FreqAI may add suffixes to feature names, so search for patterns
+        signal_cols = [col for col in train_df.columns if 'classic' in col and 'signal' in col]
+
+        logger.info(f"🔍 DEBUG - Looking for signal features in {len(train_df.columns)} columns")
+        logger.info(f"🔍 DEBUG - Found signal columns: {signal_cols if signal_cols else 'NONE'}")
+
+        if signal_cols:
+            # Find long and short signal columns
+            long_signal_cols = [col for col in signal_cols if 'long' in col]
+            short_signal_cols = [col for col in signal_cols if 'short' in col]
+
+            long_signals = 0
+            short_signals = 0
+
+            # Count signals from all matching columns
+            for col in long_signal_cols:
+                long_signals += (train_df[col] == 1).sum()
+            for col in short_signal_cols:
+                short_signals += (train_df[col] == 1).sum()
+
             total_signals = long_signals + short_signals
             signal_rate = total_signals / len(train_df) * 100
+
             logger.info(f"🔍 DEBUG - Classic signals in training: Long={long_signals}, Short={short_signals}, Total={total_signals}")
             logger.info(f"🔍 DEBUG - Signal rate: {signal_rate:.2f}% of {len(train_df)} candles")
-            if signal_rate < 1.0:
+
+            if signal_rate < 0.1:
+                logger.error(f"❌ ERROR: Signal rate too low ({signal_rate:.4f}%) - check strategy signal generation!")
+            elif signal_rate < 1.0:
                 logger.warning(f"⚠️ WARNING: Low signal rate ({signal_rate:.2f}%) may cause HOLD-only behavior!")
         else:
-            logger.error("❌ ERROR: No classic signal features found in training data!")
+            # No signal columns found - list some column names for debugging
+            sample_cols = list(train_df.columns)[:20]
+            logger.error(f"❌ ERROR: No classic signal features found in training data!")
+            logger.error(f"📋 Sample columns (first 20): {sample_cols}")
+            logger.error(f"💡 Hint: Check if strategy's feature_engineering_expand_all() adds signal features")
 
         # Prepare datasets with vectorized environments for CPU optimization
         # Try vectorized first, fallback to single env if fails
@@ -844,21 +887,25 @@ class MtfScalperRLModel(ReinforcementLearner):
     
     def _create_vec_env(self, df: DataFrame, pair: str, n_envs: int = 8, is_train: bool = True) -> Any:
         """
-        Create vectorized environments for parallel rollout collection (CPU optimization)
+        Create vectorized environments for rollout collection
+        
+        CHANGED: Using DummyVecEnv instead of SubprocVecEnv to avoid
+        multiprocessing pickling issues with self.reward_weights and other attributes.
+        This sacrifices parallel training speed for reliability and correctness.
 
         Args:
             df: Training/test dataframe
             pair: Trading pair name
-            n_envs: Number of parallel environments (default 8 for CPU)
+            n_envs: Number of sequential environments (default 8)
             is_train: Whether this is for training or prediction
 
         Returns:
-            SubprocVecEnv with n_envs parallel environments
+            DummyVecEnv with n_envs sequential environments
         """
-        from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+        from stable_baselines3.common.vec_env import DummyVecEnv
 
         def make_env(rank: int):
-            """Create environment factory for each process"""
+            """Create environment factory for each environment"""
             def _init():
                 env = self._create_env(df, pair, is_train=is_train)
                 # Set different seed for each environment
@@ -867,10 +914,12 @@ class MtfScalperRLModel(ReinforcementLearner):
                 return env
             return _init
 
-        # Use SubprocVecEnv for true CPU parallelism
-        # Each environment runs in its own process
-        logger.info(f"Creating {n_envs} parallel environments for {'training' if is_train else 'prediction'}")
-        vec_env = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+        # Use DummyVecEnv to avoid multiprocessing serialization issues
+        # Environments run sequentially rather than in parallel processes
+        logger.info(f"Creating {n_envs} sequential environments (DummyVecEnv) for {'training' if is_train else 'prediction'}")
+        logger.info("⚠️  Using DummyVecEnv instead of SubprocVecEnv to avoid multiprocessing AttributeError")
+        logger.info("    Training will be slower but stable. See implementation_plan.md for details.")
+        vec_env = DummyVecEnv([make_env(i) for i in range(n_envs)])
 
         return vec_env
 

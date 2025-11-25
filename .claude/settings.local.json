@@ -14,7 +14,13 @@
       "Bash(python:*)",
       "Bash(test:*)",
       "Bash(vastai:*)",
-      "Bash(freqtrade backtesting:*)"
+      "Bash(freqtrade backtesting:*)",
+      "Bash(wsl -d Ubuntu bash -c \"cd /mnt/c/FreqtradeProjects/RL-Trading-Validation && find user_data -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null; echo 'Python cache cleared in WSL'\":*)",
+      "Bash(powershell -Command:*)",
+      "Bash(wsl -d Ubuntu bash -c \"cd /mnt/c/FreqtradeProjects/RL-Trading-Validation && rm -f user_data/models/best_model.zip user_data/models/evaluations.npz && echo ''✓ Old model files deleted'' || echo ''✓ No old model files to delete''\")",
+      "Bash(/tmp/offers.json)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []

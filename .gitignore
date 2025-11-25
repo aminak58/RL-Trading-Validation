@@ -9,6 +9,8 @@ env/
 venv/
 env.bak/
 .venv/
+.venv_wsl/
+.claude/
 
 # IDEs
 .vscode/
