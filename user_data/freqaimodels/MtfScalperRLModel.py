@@ -643,12 +643,14 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         def _calculate_current_profit(self) -> float:
             """Calculate current profit percentage"""
-            if self._position == 0 or self.position_start_price is None:
+            if self._position == Positions.Neutral or self.position_start_price is None:
                 return 0.0
             
-            current_price = self.prices.iloc[self._current_tick]
+            # Extract scalar price from Series
+            price_row = self.prices.iloc[self._current_tick]
+            current_price = float(price_row.values[0]) if hasattr(price_row, 'values') else float(price_row)
             
-            if self._position == 1:  # Long
+            if self._position == Positions.Long:  # Long (use enum)
                 return (current_price - self.position_start_price) / self.position_start_price
             else:  # Short
                 return (self.position_start_price - current_price) / self.position_start_price
@@ -701,12 +703,13 @@ class MtfScalperRLModel(ReinforcementLearner):
                 logger.info(f"[ENTRY TRACKED] tick={self._current_tick-1}, pos={self._position}, "
                            f"entry_price={entry_price:.4f}")
             
-            # Exit: just exited position (old!=0, new=0)
+            # Exit: just exited position (old!=Neutral, new=Neutral)
             elif exit_condition:
                 if self.position_start_price:
                     # Calculate final profit before clearing
-                    current_price = self.prices.iloc[self._current_tick - 1]
-                    if old_position == 1:  # Was long
+                    price_row = self.prices.iloc[self._current_tick - 1]
+                    current_price = float(price_row.values[0]) if hasattr(price_row, 'values') else float(price_row)
+                    if old_position == Positions.Long:  # Was long
                         final_profit = (current_price - self.position_start_price) / self.position_start_price
                     else:  # Was short
                         final_profit = (self.position_start_price - current_price) / self.position_start_price
