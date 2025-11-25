@@ -174,6 +174,10 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         def __init__(self, *args, **kwargs):
             """Initialize custom environment"""
+            # Import Positions enum for use throughout this class
+            from freqtrade.freqai.RL.Base5ActionRLEnv import Positions
+            self.Positions = Positions  # Make available as instance attribute
+            
             super().__init__(*args, **kwargs)
 
             # Track position information
@@ -643,14 +647,14 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         def _calculate_current_profit(self) -> float:
             """Calculate current profit percentage"""
-            if self._position == Positions.Neutral or self.position_start_price is None:
+            if self._position == self.Positions.Neutral or self.position_start_price is None:
                 return 0.0
             
             # Extract scalar price from Series
             price_row = self.prices.iloc[self._current_tick]
             current_price = float(price_row.values[0]) if hasattr(price_row, 'values') else float(price_row)
             
-            if self._position == Positions.Long:  # Long (use enum)
+            if self._position == self.Positions.Long:  # Long (use enum)
                 return (current_price - self.position_start_price) / self.position_start_price
             else:  # Short
                 return (self.position_start_price - current_price) / self.position_start_price
@@ -683,11 +687,10 @@ class MtfScalperRLModel(ReinforcementLearner):
                        f"reward={reward:.4f}")
             
             # DEBUG: Log transition detection logic
-            from freqtrade.freqai.RL.Base5ActionRLEnv import Positions
-            entry_condition = (old_position == Positions.Neutral and new_position != Positions.Neutral)
-            exit_condition = (old_position != Positions.Neutral and new_position == Positions.Neutral)
-            logger.info(f"[DEBUG TRANSITION] old==Neutral? {old_position==Positions.Neutral}, "
-                       f"new!=Neutral? {new_position!=Positions.Neutral}, "
+            entry_condition = (old_position == self.Positions.Neutral and new_position != self.Positions.Neutral)
+            exit_condition = (old_position != self.Positions.Neutral and new_position == self.Positions.Neutral)
+            logger.info(f"[DEBUG TRANSITION] old==Neutral? {old_position==self.Positions.Neutral}, "
+                       f"new!=Neutral? {new_position!=self.Positions.Neutral}, "
                        f"entry? {entry_condition}, exit? {exit_condition}")
             
             # NOW track position changes (old vs new position)
@@ -709,7 +712,7 @@ class MtfScalperRLModel(ReinforcementLearner):
                     # Calculate final profit before clearing
                     price_row = self.prices.iloc[self._current_tick - 1]
                     current_price = float(price_row.values[0]) if hasattr(price_row, 'values') else float(price_row)
-                    if old_position == Positions.Long:  # Was long
+                    if old_position == self.Positions.Long:  # Was long
                         final_profit = (current_price - self.position_start_price) / self.position_start_price
                     else:  # Was short
                         final_profit = (self.position_start_price - current_price) / self.position_start_price
