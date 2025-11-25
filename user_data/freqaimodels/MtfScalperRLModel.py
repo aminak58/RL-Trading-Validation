@@ -460,31 +460,32 @@ class MtfScalperRLModel(ReinforcementLearner):
         
         def _calculate_drawdown_score(self) -> float:
             """
-            Score based on drawdown control
-            Penalizes positions that experienced large drawdowns
+            Calculate drawdown control score
+            Rewards minimizing drawdown during the trade
             """
             if self.position_start_step is None:
                 return 0.0
             
-            # Calculate maximum drawdown during position
-            position_prices = self.prices.iloc[self.position_start_step:self._current_tick + 1]
+            # Get price range during position
+            prices_in_position = self.prices.iloc[self.position_start_step:self._current_tick + 1]
             
-            if self._position == 1:  # Long
-                max_price = position_prices.max()
-                current_price = self.prices.iloc[self._current_tick]
+            # Extract scalar values from Series
+            price_row = self.prices.iloc[self._current_tick]
+            current_price = float(price_row.values[0]) if hasattr(price_row, 'values') else float(price_row)
+            
+            min_price_row = prices_in_position.min()
+            min_price = float(min_price_row.values[0]) if hasattr(min_price_row, 'values') else float(min_price_row)
+            
+            max_price_row = prices_in_position.max()
+            max_price = float(max_price_row.values[0]) if hasattr(max_price_row, 'values') else float(max_price_row)
+            
+            if self._position == self.Positions.Long:
+                # For long: drawdown from peak
                 drawdown = (max_price - current_price) / max_price if max_price > 0 else 0
-            else:  # Short
-                min_price = position_prices.min()
-                current_price = self.prices.iloc[self._current_tick]
+            else:
+                # For short: drawdown from lowest point
                 drawdown = (current_price - min_price) / min_price if min_price > 0 else 0
             
-            # Score calculation (lower drawdown = better score)
-            if drawdown < 0.005:  # Less than 0.5%
-                return 5.0
-            elif drawdown < 0.01:  # Less than 1%
-                return 2.0
-            elif drawdown < 0.02:  # Less than 2%
-                return 0.0
             else:  # More than 2%
                 return -5.0 * drawdown
         
