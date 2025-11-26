@@ -168,7 +168,7 @@ class MtfScalper_RL_Hybrid(IStrategy):
     def freqai_config(self) -> Dict[str, Any]:
         """Returns FreqAI configuration for RL model"""
         return {
-            "enabled": False,  # DIAGNOSTIC: Temporarily disabled to test classic strategy baseline
+            "enabled": True,  # FreqAI enabled for RL-based exit optimization
             "purge_old_models": False,
             "train_period_days": 30,
             "backtest_period_days": 7,
